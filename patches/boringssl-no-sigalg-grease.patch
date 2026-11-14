@@ -1,0 +1,15 @@
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -1028,9 +1028,10 @@
+       !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb)) {
+     return false;
+   }
+-  // Add a fake signature algorithm. See RFC 8701.
+-  if (hs->ssl->ctx->grease_enabled &&
++  // Chrome 133 does not put GREASE in signature_algorithms. Keep the global
++  // GREASE toggle for all other Chrome GREASE values, but skip this one.
++  if (false && hs->ssl->ctx->grease_enabled &&
+       !CBB_add_u16(&sigalgs_cbb,
+                    ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
+     return false;
+   }

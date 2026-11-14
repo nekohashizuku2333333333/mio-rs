@@ -1,0 +1,147 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 67b6537..fe464b4 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -1176,6 +1176,15 @@ OPENSSL_EXPORT EVP_PKEY *SSL_CTX_get0_privatekey(const SSL_CTX *ctx);
+ // SSL_get_privatekey returns `ssl`'s private key.
+ OPENSSL_EXPORT EVP_PKEY *SSL_get_privatekey(const SSL *ssl);
+ 
++// SSL_get_x25519_key_share_private_key copies the X25519 key share private key
++// generated for the initial ClientHello to `out`. It returns one and writes
++// exactly 32 bytes if the initial ClientHello contained an X25519 key share and
++// its private key was serialized. Otherwise, it returns zero. The key remains
++// available after HelloRetryRequest and handshake completion, including if
++// handshake configuration shedding is enabled.
++OPENSSL_EXPORT int SSL_get_x25519_key_share_private_key(const SSL *ssl,
++                                                       uint8_t out[32]);
++
+ // SSL_CTX_get0_chain_certs sets `*out_chain` to `ctx`'s certificate chain and
+ // returns one.
+ OPENSSL_EXPORT int SSL_CTX_get0_chain_certs(const SSL_CTX *ctx,
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 7c498cd..c22702f 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -2419,6 +2419,12 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+   SSLImpl *const ssl = hs->ssl;
+   hs->key_shares.clear();
+   hs->key_share_bytes.Reset();
++  if (override_group_id == 0) {
++    // This is the initial ClientHello. Start with no cached X25519 private key
++    // and populate it below if the selection includes an X25519 share.
++    ssl->config->x25519_key_share_private_key.Reset();
++    ssl->x25519_key_share_private_key.Reset();
++  }
+ 
+   // If offering a PAKE, do not set up key shares. We do not currently support
+   // clients offering both PAKE and non-PAKE modes, including resumption.
+@@ -2504,18 +2510,37 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+     }
+   }
+ 
++  Array<uint8_t> x25519_private_key;
+   CBB key_exchange;
+   for (const uint16_t group_id : *selected_key_shares) {
+     UniquePtr<SSLKeyShare> key_share = SSLKeyShare::Create(group_id);
+     if (key_share == nullptr ||                                    //
+         !CBB_add_u16(cbb.get(), group_id) ||                       //
+         !CBB_add_u16_length_prefixed(cbb.get(), &key_exchange) ||  //
+-        !key_share->Generate(&key_exchange) ||                     //
+-        !hs->key_shares.TryPushBack(std::move(key_share))) {
++        !key_share->Generate(&key_exchange)) {
++      return false;
++    }
++
++    if (group_id == SSL_GROUP_X25519) {
++      ScopedCBB private_key_cbb;
++      if (!CBB_init(private_key_cbb.get(), 32) ||
++          !key_share->SerializePrivateKey(private_key_cbb.get()) ||
++          !CBBFinishArray(private_key_cbb.get(), &x25519_private_key) ||
++          x25519_private_key.size() != 32) {
++        return false;
++      }
++    }
++
++    if (!hs->key_shares.TryPushBack(std::move(key_share))) {
+       return false;
+     }
+   }
+ 
++  if (override_group_id == 0) {
++    ssl->config->x25519_key_share_private_key =
++        std::move(x25519_private_key);
++  }
++
+   return CBBFinishArray(cbb.get(), &hs->key_share_bytes);
+ }
+ 
+diff --git a/ssl/internal.h b/ssl/internal.h
+index 0872532..88ac300 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -3478,6 +3478,12 @@ struct SSL_CONFIG {
+   std::optional<InplaceVector<uint16_t, kNumNamedGroups>>
+       client_key_share_selections;
+ 
++  // x25519_key_share_private_key is the serialized private key for the X25519
++  // key share sent in the initial ClientHello, or empty if no such share was
++  // sent. It is populated by `ssl_setup_key_shares` and retained across
++  // HelloRetryRequest.
++  Array<uint8_t> x25519_key_share_private_key;
++
+   // For a client, this contains a list of groups believed to be supported by
+   // the server, in server preference order.
+   Array<uint16_t> server_supported_groups_hint;
+@@ -4241,6 +4247,10 @@ class SSLImpl : public ssl_st {
+   // that instead, and skip the null check.)
+   UniquePtr<SSL_CONFIG> config;
+ 
++  // x25519_key_share_private_key preserves the initial ClientHello X25519 key
++  // share private key after handshake configuration is shed.
++  Array<uint8_t> x25519_key_share_private_key;
++
+   uint16_t max_send_fragment = 0;
+ 
+   // There are 2 BIO's even though they are normally both the same. This is so
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 78b8778..e3a1c87 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -309,6 +309,10 @@ static void ssl_maybe_shed_handshake_config(SSLImpl *ssl) {
+     return;
+   }
+ 
++  // The X25519 key share private key is handshake output, not configuration.
++  // Preserve it on SSLImpl before releasing SSL_CONFIG.
++  ssl->x25519_key_share_private_key =
++      std::move(ssl->config->x25519_key_share_private_key);
+   ssl->config.reset();
+ }
+ 
+@@ -2696,6 +2700,26 @@ EVP_PKEY *SSL_CTX_get0_privatekey(const SSL_CTX *ctx) {
+   return FromOpaque(ctx)->cert->legacy_credential->privkey.get();
+ }
+ 
++int SSL_get_x25519_key_share_private_key(const SSL *ssl, uint8_t out[32]) {
++  if (ssl == nullptr || out == nullptr) {
++    return 0;
++  }
++
++  const auto *ssl_impl = FromOpaque(ssl);
++  Span<const uint8_t> private_key;
++  if (ssl_impl->config != nullptr) {
++    private_key = ssl_impl->config->x25519_key_share_private_key;
++  } else {
++    private_key = ssl_impl->x25519_key_share_private_key;
++  }
++  if (private_key.size() != 32) {
++    return 0;
++  }
++
++  OPENSSL_memcpy(out, private_key.data(), private_key.size());
++  return 1;
++}
++
+ const SSL_CIPHER *SSL_get_current_cipher(const SSL *ssl) {
+   const SSLSession *session = ssl_get_session(FromOpaque(ssl));
+   return session == nullptr ? nullptr : session->cipher;

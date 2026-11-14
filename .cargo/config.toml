@@ -1,0 +1,3 @@
+[env]
+BORING_BSSL_SOURCE_PATH = { value = "vendor/boringssl", relative = true }
+BORING_BSSL_ASSUME_PATCHED = "1"

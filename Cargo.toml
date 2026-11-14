@@ -1,0 +1,48 @@
+[package]
+name = "mio-rs"
+version = "0.5.1"
+edition = "2024"
+rust-version = "1.88"
+license-file = "LICENSE"
+description = "A Rust implementation of the mio proxy protocol with a Chrome-compatible TLS ClientHello"
+
+[[bin]]
+name = "mio"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = "0.10.3"
+aes = "0.8"
+anyhow = "1.0"
+base64 = "0.22"
+boring = "5.4"
+boring-sys = "5.4"
+brotli = "8.0"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+foreign-types = "0.5"
+hkdf = "0.12"
+hmac = "0.12"
+kem = "=0.3.0-pre.0"
+log = "0.4"
+md-5 = "0.10"
+ml-kem = "0.2"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rand = "0.8"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+simplelog = "0.12"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
+toml = "0.8"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+hex = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

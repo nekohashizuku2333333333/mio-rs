@@ -1,0 +1,330 @@
+use anyhow::{Context, Result, anyhow};
+use log::{debug, info, warn};
+use std::io::{BufReader, Write};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::config::InboundConfig;
+use crate::crypto::{parse_private_key, server_exchange, transport_keys, verify_auth};
+use crate::protocol::{
+    self, EncryptedStream, FRAME_READY, HANDSHAKE_SERVER_HELLO, RECORD_APPDATA, RECORD_HANDSHAKE,
+};
+use crate::quic;
+use crate::tls;
+use x25519_dalek::StaticSecret;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct RelayState {
+    client_random: Option<[u8; 32]>,
+    server_random: Option<[u8; 32]>,
+    client_key_share: Option<[u8; 32]>,
+    auth_shared: Option<[u8; 32]>,
+    auth_client_share: Option<Vec<u8>>,
+    destination_done: bool,
+}
+
+struct SharedState {
+    state: Mutex<RelayState>,
+    changed: Condvar,
+    authenticated: AtomicBool,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RelayState::default()),
+            changed: Condvar::new(),
+            authenticated: AtomicBool::new(false),
+        }
+    }
+
+    fn set_server_random(&self, random: [u8; 32]) {
+        let mut state = self.state.lock().unwrap();
+        state.server_random = Some(random);
+        self.changed.notify_all();
+    }
+
+    fn set_client_hello(&self, random: [u8; 32], key_share: [u8; 32]) {
+        let mut state = self.state.lock().unwrap();
+        state.client_random = Some(random);
+        state.client_key_share = Some(key_share);
+    }
+
+    fn set_authenticated(&self, shared: [u8; 32], client_share: Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+        state.auth_shared = Some(shared);
+        state.auth_client_share = Some(client_share);
+        self.authenticated.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    fn is_authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::Acquire)
+    }
+
+    fn wait_server_random(&self, timeout: Duration) -> Option<[u8; 32]> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        while state.server_random.is_none() {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
+        state.server_random
+    }
+
+    fn mark_destination_done(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.destination_done = true;
+        self.changed.notify_all();
+    }
+
+    fn wait_destination_done(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        while !state.destination_done {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let remaining = deadline - now;
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
+    }
+}
+
+pub fn run(config: InboundConfig, stop: Arc<AtomicBool>) -> Result<()> {
+    let private_key = Arc::new(parse_private_key(&config.private_key)?);
+    let address = format!("{}:{}", config.listen, config.listen_port);
+    let listener =
+        TcpListener::bind(&address).with_context(|| format!("listen on mio address {address}"))?;
+    listener
+        .set_nonblocking(true)
+        .context("configure mio listener")?;
+    info!("mio TCP listening on {}", listener.local_addr()?);
+    let quic_config = config.clone();
+    let quic_stop = stop.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = quic::run_server(quic_config, quic_stop) {
+            warn!("QUIC disabled: {error:#}");
+        }
+    });
+
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, remote)) => {
+                let config = config.clone();
+                let private_key = private_key.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = serve_connection(stream, &config, &private_key) {
+                        debug!("connection from {remote} ended: {error:#}");
+                    }
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error).context("accept mio connection"),
+        }
+    }
+    Ok(())
+}
+
+fn serve_connection(
+    client: TcpStream,
+    config: &InboundConfig,
+    server_private: &StaticSecret,
+) -> Result<()> {
+    client.set_nodelay(true).ok();
+    let remote = client.peer_addr()?;
+    let destination_address = format!("{}:{}", config.dest, config.dest_port);
+    let mut destination = connect_target(&config.dest, config.dest_port)
+        .with_context(|| format!("connect camouflage destination {destination_address}"))?;
+
+    let state = Arc::new(SharedState::new());
+    let destination_reader = destination.try_clone()?;
+    let mut client_writer_for_destination = client.try_clone()?;
+    let client_reader = BufReader::new(client.try_clone()?);
+
+    let state_for_destination = state.clone();
+    let destination_task = std::thread::spawn(move || {
+        let mut reader = BufReader::new(destination_reader);
+        let result = protocol::copy_records(
+            &mut client_writer_for_destination,
+            &mut reader,
+            |header, body| {
+                if header[0] == RECORD_HANDSHAKE
+                    && body.len() >= 38
+                    && body[0] == HANDSHAKE_SERVER_HELLO
+                {
+                    let mut random = [0_u8; 32];
+                    random.copy_from_slice(&body[6..38]);
+                    state_for_destination.set_server_random(random);
+                }
+                false
+            },
+        );
+        if !state_for_destination.is_authenticated() {
+            let _ = client_writer_for_destination.shutdown(std::net::Shutdown::Both);
+        }
+        state_for_destination.mark_destination_done();
+        result
+    });
+
+    let mut client_reader = client_reader;
+    let state_for_client = state.clone();
+    let authenticated =
+        protocol::copy_records(&mut destination, &mut client_reader, |header, body| {
+            if header[0] == RECORD_HANDSHAKE {
+                let mut record = Vec::with_capacity(header.len() + body.len());
+                record.extend_from_slice(header);
+                record.extend_from_slice(body);
+                if let Ok((random, key_share)) = tls::parse_client_hello_security(&record) {
+                    state_for_client.set_client_hello(random, key_share);
+                }
+            }
+            if header[0] != RECORD_APPDATA {
+                return false;
+            }
+            let Some(server_random) = state_for_client.wait_server_random(Duration::from_secs(2))
+            else {
+                return false;
+            };
+            let (client_random, client_key_share) = {
+                let state = state_for_client.state.lock().unwrap();
+                (state.client_random, state.client_key_share)
+            };
+            let (Some(client_random), Some(client_key_share)) = (client_random, client_key_share)
+            else {
+                return false;
+            };
+            if let Some((shared, share)) = verify_auth(
+                server_private,
+                &client_key_share,
+                &client_random,
+                &server_random,
+                header,
+                body,
+            ) {
+                debug!("static-key authentication verified");
+                state_for_client.set_authenticated(shared, share);
+                return true;
+            }
+            debug!("application-data record is not mio authentication");
+            false
+        });
+
+    if !authenticated.unwrap_or(false) {
+        let _ = destination.shutdown(std::net::Shutdown::Both);
+        let _ = destination_task.join();
+        return Ok(());
+    }
+    let _ = destination.shutdown(std::net::Shutdown::Both);
+    state.wait_destination_done(Duration::from_secs(2));
+    let _ = destination_task.join();
+
+    let (client_random, server_random, shared, client_share) = {
+        let state = state.state.lock().unwrap();
+        (
+            state
+                .client_random
+                .ok_or_else(|| anyhow!("missing client_random"))?,
+            state
+                .server_random
+                .ok_or_else(|| anyhow!("missing server_random"))?,
+            state
+                .auth_shared
+                .ok_or_else(|| anyhow!("missing authentication shared key"))?,
+            state
+                .auth_client_share
+                .clone()
+                .ok_or_else(|| anyhow!("missing client hybrid share"))?,
+        )
+    };
+
+    let (reply, secret) = server_exchange(&client_share)?;
+    let (send, recv) = transport_keys(&shared, None, &client_random, &server_random, false)?;
+    let mut secure = EncryptedStream::from_reader(client_reader, client, send, recv);
+    secure.write_frame(FRAME_READY, &reply)?;
+    secure.flush()?;
+    let (send, recv) = transport_keys(
+        &shared,
+        Some(&secret),
+        &client_random,
+        &server_random,
+        false,
+    )?;
+    secure.rekey(send, recv);
+    info!("authenticated client from {remote}");
+    proxy_authenticated(secure).context("proxy authenticated connection")
+}
+
+fn proxy_authenticated(mut secure: EncryptedStream) -> Result<()> {
+    secure
+        .set_read_timeout(Some(REQUEST_TIMEOUT))
+        .context("set target request timeout")?;
+    let target = protocol::read_request(&mut secure).context("read target request")?;
+    secure
+        .set_read_timeout(None)
+        .context("clear target request timeout")?;
+
+    let remote = match connect_target_from_authority(&target) {
+        Ok(remote) => remote,
+        Err(error) => {
+            warn!("connect target {target} failed: {error:#}");
+            secure.set_next_padding(16, 512);
+            protocol::write_reply(&mut secure, false)?;
+            secure.flush()?;
+            return Ok(());
+        }
+    };
+
+    secure.set_next_padding(16, 512);
+    protocol::write_reply(&mut secure, true)?;
+    secure.flush()?;
+    info!("proxy target {target}");
+    protocol::relay(remote, secure).context("relay target traffic")
+}
+
+fn connect_target_from_authority(target: &str) -> Result<TcpStream> {
+    let (host, port) = protocol::split_host_port(target)?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| anyhow!("invalid target port"))?;
+    connect_target(host, port)
+}
+
+fn connect_target(host: &str, port: u16) -> Result<TcpStream> {
+    let mut last_error = None;
+    for address in (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve {host}:{port}"))?
+    {
+        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                stream.set_nodelay(true).ok();
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow!("{host}:{port} resolved to no addresses")))
+}
