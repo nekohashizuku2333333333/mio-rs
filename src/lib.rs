@@ -4,5 +4,6 @@ pub mod crypto;
 pub mod protocol;
 pub mod quic;
 pub mod server;
+pub mod session;
 pub mod tls;
 pub mod udp_demux;

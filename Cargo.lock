@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "mio-rs"
-version = "0.5.1"
+version = "0.5.5"
 dependencies = [
  "aes",
  "aes-gcm",

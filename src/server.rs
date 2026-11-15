@@ -1,22 +1,22 @@
 use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::InboundConfig;
-use crate::crypto::{parse_private_key, server_exchange, transport_keys, verify_auth};
-use crate::protocol::{
-    self, EncryptedStream, FRAME_READY, HANDSHAKE_SERVER_HELLO, RECORD_APPDATA, RECORD_HANDSHAKE,
-};
+use crate::crypto::{parse_private_key, read_share, server_exchange, transport_keys, verify_auth};
+use crate::protocol::{self, HANDSHAKE_SERVER_HELLO, RECORD_APPDATA, RECORD_HANDSHAKE};
 use crate::quic;
+use crate::session::{Session, Stream};
 use crate::tls;
 use x25519_dalek::StaticSecret;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SHARE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct RelayState {
@@ -24,7 +24,6 @@ struct RelayState {
     server_random: Option<[u8; 32]>,
     client_key_share: Option<[u8; 32]>,
     auth_shared: Option<[u8; 32]>,
-    auth_client_share: Option<Vec<u8>>,
     destination_done: bool,
 }
 
@@ -55,10 +54,9 @@ impl SharedState {
         state.client_key_share = Some(key_share);
     }
 
-    fn set_authenticated(&self, shared: [u8; 32], client_share: Vec<u8>) {
+    fn set_authenticated(&self, shared: [u8; 32]) {
         let mut state = self.state.lock().unwrap();
         state.auth_shared = Some(shared);
-        state.auth_client_share = Some(client_share);
         self.authenticated.store(true, Ordering::Release);
         self.changed.notify_all();
     }
@@ -214,7 +212,7 @@ fn serve_connection(
             else {
                 return false;
             };
-            if let Some((shared, share)) = verify_auth(
+            if let Some(shared) = verify_auth(
                 server_private,
                 &client_key_share,
                 &client_random,
@@ -223,7 +221,7 @@ fn serve_connection(
                 body,
             ) {
                 debug!("static-key authentication verified");
-                state_for_client.set_authenticated(shared, share);
+                state_for_client.set_authenticated(shared);
                 return true;
             }
             debug!("application-data record is not mio authentication");
@@ -239,7 +237,7 @@ fn serve_connection(
     state.wait_destination_done(Duration::from_secs(2));
     let _ = destination_task.join();
 
-    let (client_random, server_random, shared, client_share) = {
+    let (client_random, server_random, shared) = {
         let state = state.state.lock().unwrap();
         (
             state
@@ -251,18 +249,21 @@ fn serve_connection(
             state
                 .auth_shared
                 .ok_or_else(|| anyhow!("missing authentication shared key"))?,
-            state
-                .auth_client_share
-                .clone()
-                .ok_or_else(|| anyhow!("missing client hybrid share"))?,
         )
     };
 
-    let (reply, secret) = server_exchange(&client_share)?;
+    client
+        .set_read_timeout(Some(SHARE_TIMEOUT))
+        .context("set share record timeout")?;
+    let shared_key = read_share(&mut client_reader, &shared, &client_random, &server_random)
+        .context("read client hybrid share record")?;
+    client
+        .set_read_timeout(None)
+        .context("clear share record timeout")?;
+    let (reply, secret) = server_exchange(&shared_key)?;
     let (send, recv) = transport_keys(&shared, None, &client_random, &server_random, false)?;
-    let mut secure = EncryptedStream::from_reader(client_reader, client, send, recv);
-    secure.write_frame(FRAME_READY, &reply)?;
-    secure.flush()?;
+    let session = Session::new(client, client_reader, send, recv, false);
+    session.write_ready(&reply)?;
     let (send, recv) = transport_keys(
         &shared,
         Some(&secret),
@@ -270,36 +271,50 @@ fn serve_connection(
         &server_random,
         false,
     )?;
-    secure.rekey(send, recv);
+    session.rekey(send, recv);
+    session.start();
     info!("authenticated client from {remote}");
-    proxy_authenticated(secure).context("proxy authenticated connection")
+    loop {
+        match session.accept() {
+            Ok(stream) => {
+                std::thread::spawn(move || {
+                    if let Err(error) = proxy_stream(stream) {
+                        debug!("proxied stream ended: {error:#}");
+                    }
+                });
+            }
+            Err(error) => {
+                session.close();
+                return Err(error);
+            }
+        }
+    }
 }
 
-fn proxy_authenticated(mut secure: EncryptedStream) -> Result<()> {
-    secure
-        .set_read_timeout(Some(REQUEST_TIMEOUT))
-        .context("set target request timeout")?;
-    let target = protocol::read_request(&mut secure).context("read target request")?;
-    secure
-        .set_read_timeout(None)
-        .context("clear target request timeout")?;
+fn proxy_stream(mut stream: Stream) -> Result<()> {
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+    let target = protocol::read_request(&mut stream).context("read target request")?;
+    stream.set_read_timeout(None);
 
     let remote = match connect_target_from_authority(&target) {
         Ok(remote) => remote,
         Err(error) => {
             warn!("connect target {target} failed: {error:#}");
-            secure.set_next_padding(16, 512);
-            protocol::write_reply(&mut secure, false)?;
-            secure.flush()?;
+            stream.set_next_padding(16, 512);
+            protocol::write_reply(&mut stream, false)?;
+            stream.close()?;
             return Ok(());
         }
     };
 
-    secure.set_next_padding(16, 512);
-    protocol::write_reply(&mut secure, true)?;
-    secure.flush()?;
+    stream.set_next_padding(16, 512);
+    protocol::write_reply(&mut stream, true)?;
     info!("proxy target {target}");
-    protocol::relay(remote, secure).context("relay target traffic")
+    let reader = stream.clone();
+    let writer = stream.clone();
+    protocol::relay_halves(remote, reader, writer).context("relay target traffic")?;
+    stream.close()?;
+    Ok(())
 }
 
 fn connect_target_from_authority(target: &str) -> Result<TcpStream> {

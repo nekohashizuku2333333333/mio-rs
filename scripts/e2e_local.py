@@ -172,7 +172,35 @@ def main() -> None:
                 break
             received += chunk
         assert received == payload, (len(received), len(payload))
-        print("E2E PASS: SOCKS5 -> mio -> echo")
+
+        # A second SOCKS request should reuse the same authenticated TCP/QUIC
+        # session instead of requiring a new outer connection.
+        second = socket.create_connection(("127.0.0.1", SOCKS_PORT), 3)
+        second.settimeout(10)
+        second.sendall(b"\x05\x01\x00")
+        assert second.recv(2) == b"\x05\x00"
+        second.sendall(
+            b"\x05\x01\x00\x03"
+            + bytes([len(host)])
+            + host
+            + ECHO_PORT.to_bytes(2, "big")
+        )
+        reply = second.recv(10)
+        assert reply[:2] == b"\x05\x00", reply.hex()
+        second_payload = b"mio-rs multiplexed session\n" * 100
+        second.sendall(second_payload)
+        second_received = b""
+        while len(second_received) < len(second_payload):
+            chunk = second.recv(65536)
+            if not chunk:
+                break
+            second_received += chunk
+        assert second_received == second_payload, (
+            len(second_received),
+            len(second_payload),
+        )
+        second.close()
+        print("E2E PASS: SOCKS5 -> mio -> echo (two requests)")
     finally:
         for process in processes:
             process.terminate()

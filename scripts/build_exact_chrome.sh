@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuild the release binary against the vendored, pre-patched BoringSSL.
-# The vendor tree provides both Chrome 133 sigalg shape and the v0.5.1
+# The vendor tree provides both Chrome 133 sigalg shape and the v0.5.3
 # ClientHello X25519 key_share private-key getter.
 set -euo pipefail
 

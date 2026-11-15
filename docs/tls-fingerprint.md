@@ -106,7 +106,7 @@ Chrome 106+ 与 uTLS `ShuffleChromeTLSExtensions` 会随机打乱 16 个非 GREA
 ## BoringSSL 补丁与 vendored 构建
 
 stock BoringSSL 会在 `signature_algorithms` 中多放一个 GREASE 值，并且不会暴露
-TLS ClientHello 的 X25519 key_share 私钥。mio v0.5.1 的静态认证同时需要这两项，
+TLS ClientHello 的 X25519 key_share 私钥。mio v0.5.3 的静态认证同时需要这两项，
 因此仓库内置 `vendor/boringssl` 并在其上应用三个补丁：
 
 1. `boring-pq.patch`（boring-sys 的 Cloudflare PQ 补丁）

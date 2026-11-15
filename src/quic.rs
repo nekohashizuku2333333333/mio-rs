@@ -24,8 +24,8 @@ use crate::udp_demux::UdpDemuxSocket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const QUIC_EXPORTER_LABEL: &[u8] = b"mio quic auth";
-const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.5.1";
-const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.1";
+const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.5.3";
+const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.3";
 const QUIC_CLIENT_LABEL: &[u8] = b"client";
 const QUIC_SERVER_LABEL: &[u8] = b"server";
 const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);

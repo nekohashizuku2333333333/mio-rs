@@ -145,10 +145,20 @@ fn run_service(path: PathBuf) -> Result<()> {
     ctrlc::set_handler(move || signal_stop.store(true, std::sync::atomic::Ordering::Relaxed))
         .context("install signal handler")?;
 
-    if config.is_server() {
-        server::run(config.inbounds, stop)
-    } else {
-        client::run(config.outbounds, stop)
+    match (config.has_server(), config.has_client()) {
+        (true, true) => {
+            let server_stop = stop.clone();
+            let inbound = config.inbounds;
+            std::thread::spawn(move || {
+                if let Err(error) = server::run(inbound, server_stop) {
+                    log::error!("server stopped: {error:#}");
+                }
+            });
+            client::run(config.outbounds, stop)
+        }
+        (true, false) => server::run(config.inbounds, stop),
+        (false, true) => client::run(config.outbounds, stop),
+        (false, false) => unreachable!("validated configuration has at least one service"),
     }
 }
 

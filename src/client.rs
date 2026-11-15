@@ -1,16 +1,17 @@
 use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, info, warn};
 use rand::Rng;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::OutboundConfig;
-use crate::crypto::{ClientKeys, auth_record, parse_public_key, transport_keys, x25519_shared};
-use crate::protocol::{self, EncryptedStream};
+use crate::crypto::{ClientKeys, auth_records, parse_public_key, transport_keys, x25519_shared};
+use crate::protocol;
 use crate::quic::{QuicSession, QuicStream, TargetConnectFailed};
+use crate::session::{Session, Stream};
 use crate::tls;
 use x25519_dalek::StaticSecret;
 
@@ -24,7 +25,7 @@ struct SocksRequest {
 }
 
 enum ProxyConnection {
-    Tcp(Box<EncryptedStream>),
+    Tcp(Stream),
     Quic(QuicStream),
 }
 
@@ -50,6 +51,7 @@ struct DialerState {
 
 struct Dialer {
     peer: OutboundConfig,
+    tcp_session: Mutex<Option<Session>>,
     state: Mutex<DialerState>,
 }
 
@@ -70,6 +72,7 @@ impl Dialer {
     fn new(peer: OutboundConfig) -> Self {
         Self {
             peer,
+            tcp_session: Mutex::new(None),
             state: Mutex::new(DialerState {
                 session: None,
                 selected: TransportChoice::Unknown,
@@ -129,8 +132,8 @@ impl Dialer {
         match choice {
             DialChoice::Probe => self.probe(target),
             DialChoice::Tcp => {
-                match dial_tcp(&self.peer, target) {
-                    Ok(stream) => Ok(ProxyConnection::Tcp(Box::new(stream))),
+                match self.dial_tcp(target) {
+                    Ok(stream) => Ok(ProxyConnection::Tcp(stream)),
                     Err(tcp_error) => {
                         if is_target_failure(&tcp_error) {
                             return Err(tcp_error);
@@ -172,11 +175,32 @@ impl Dialer {
                     }
                     state.selected = TransportChoice::Tcp;
                     drop(state);
-                    dial_tcp(&self.peer, target)
-                        .map(|stream| ProxyConnection::Tcp(Box::new(stream)))
+                    self.dial_tcp(target).map(ProxyConnection::Tcp)
                 }
             },
         }
+    }
+
+    fn tcp_session(&self) -> Result<Session> {
+        let mut slot = self.tcp_session.lock().unwrap();
+        if let Some(session) = slot.as_ref()
+            && !session.is_closed()
+            && session.num_streams() < 100
+        {
+            return Ok(session.clone());
+        }
+        let session = connect_tcp_session(&self.peer)?;
+        *slot = Some(session.clone());
+        Ok(session)
+    }
+
+    fn dial_tcp(&self, target: &str) -> Result<Stream> {
+        let session = self.tcp_session()?;
+        let result = open_tcp_stream(&session, target);
+        if result.is_err() && session.is_closed() {
+            *self.tcp_session.lock().unwrap() = None;
+        }
+        result
     }
 
     fn probe(self: &Arc<Self>, target: &str) -> Result<ProxyConnection> {
@@ -186,8 +210,7 @@ impl Dialer {
         let tcp_target = target.to_string();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let connection = dial_tcp(&tcp_peer, &tcp_target)
-                .map(|stream| ProxyConnection::Tcp(Box::new(stream)));
+            let connection = dial_tcp_once(&tcp_peer, &tcp_target).map(ProxyConnection::Tcp);
             let _ = tcp_sender.send(ProbeResult {
                 transport: TransportChoice::Tcp,
                 connection,
@@ -366,8 +389,13 @@ fn handle_client(mut client: TcpStream, dialer: &Arc<Dialer>) -> Result<()> {
     };
     socks_reply(&mut client, true)?;
     match connection {
-        ProxyConnection::Tcp(secure) => {
-            protocol::relay(client, *secure).context("relay SOCKS5 traffic")
+        ProxyConnection::Tcp(stream) => {
+            let reader = stream.clone();
+            let writer = stream.clone();
+            let result =
+                protocol::relay_halves(client, reader, writer).context("relay SOCKS5 TCP traffic");
+            let _ = stream.close();
+            result
         }
         ProxyConnection::Quic(stream) => {
             let (reader, writer) = stream.split();
@@ -440,7 +468,7 @@ fn format_target(host: &str, port: u16) -> String {
     }
 }
 
-fn dial_tcp(peer: &OutboundConfig, target: &str) -> Result<EncryptedStream> {
+fn connect_tcp_session(peer: &OutboundConfig) -> Result<Session> {
     let server = format_target(&peer.server, peer.server_port);
     let handshake = tls::connect_chrome(&server, &peer.dest, peer.insecure)
         .with_context(|| format!("outer TLS handshake through {server}"))?;
@@ -449,7 +477,7 @@ fn dial_tcp(peer: &OutboundConfig, target: &str) -> Result<EncryptedStream> {
     let client_private = StaticSecret::from(handshake.x25519_private);
     let shared = x25519_shared(&client_private, &server_public);
     let keys = ClientKeys::generate();
-    let record = auth_record(
+    let records = auth_records(
         &shared,
         &handshake.client_random,
         &handshake.server_random,
@@ -459,7 +487,7 @@ fn dial_tcp(peer: &OutboundConfig, target: &str) -> Result<EncryptedStream> {
     stream
         .set_write_timeout(Some(CONNECT_TIMEOUT))
         .context("set authentication write timeout")?;
-    protocol::write_all(&mut stream, &record).context("send mio authentication record")?;
+    protocol::write_all(&mut stream, &records).context("send mio authentication records")?;
 
     let (send, recv) = transport_keys(
         &shared,
@@ -468,7 +496,8 @@ fn dial_tcp(peer: &OutboundConfig, target: &str) -> Result<EncryptedStream> {
         &handshake.server_random,
         true,
     )?;
-    let mut secure = EncryptedStream::new(stream, send, recv)?;
+    let reader = BufReader::new(stream.try_clone()?);
+    let secure = Session::new(stream, reader, send, recv, true);
     secure
         .set_read_timeout(Some(READY_TIMEOUT))
         .context("set ready timeout")?;
@@ -482,22 +511,35 @@ fn dial_tcp(peer: &OutboundConfig, target: &str) -> Result<EncryptedStream> {
         true,
     )?;
     secure.rekey(send, recv);
-    secure
-        .set_read_timeout(None)
-        .context("clear ready timeout")?;
+    secure.set_read_timeout(None).ok();
+    secure.start();
+    Ok(secure)
+}
 
-    secure.set_next_padding(16, 512);
-    protocol::write_request(&mut secure, target).context("send target request")?;
-    secure.flush().context("flush target request")?;
-    secure
-        .set_read_timeout(Some(REPLY_TIMEOUT))
-        .context("set target reply timeout")?;
-    let connected = protocol::read_reply(&mut secure).context("read target reply")?;
-    secure
-        .set_read_timeout(None)
-        .context("clear target reply timeout")?;
+fn open_tcp_stream(session: &Session, target: &str) -> Result<Stream> {
+    let mut stream = session.open().context("open TCP target stream")?;
+    stream.set_next_padding(16, 512);
+    if let Err(error) = protocol::write_request(&mut stream, target) {
+        let _ = stream.close();
+        return Err(error);
+    }
+    stream.set_read_timeout(Some(REPLY_TIMEOUT));
+    let connected = match protocol::read_reply(&mut stream) {
+        Ok(connected) => connected,
+        Err(error) => {
+            let _ = stream.close();
+            return Err(error);
+        }
+    };
+    stream.set_read_timeout(None);
     if !connected {
+        let _ = stream.close();
         return Err(TcpTargetConnectFailed.into());
     }
-    Ok(secure)
+    Ok(stream)
+}
+
+fn dial_tcp_once(peer: &OutboundConfig, target: &str) -> Result<Stream> {
+    let session = connect_tcp_session(peer)?;
+    open_tcp_stream(&session, target)
 }

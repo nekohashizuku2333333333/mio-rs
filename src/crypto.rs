@@ -8,12 +8,16 @@ use kem::{Decapsulate, Encapsulate};
 use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 use rand::{Rng, RngCore, rngs::OsRng};
 use sha2::Sha256;
+use std::io::Read;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::protocol::{RECORD_APPDATA, RECORD_HEADER_SIZE, max_record_body};
 
-pub const PROTOCOL_VERSION: &str = "0.5.1";
-const AUTH_INFO: &[u8] = b"mio auth 0.5.1";
+pub const PROTOCOL_VERSION: &str = "0.5.3";
+const AUTH_INFO: &[u8] = b"mio auth 0.5.3";
+pub const AUTH_PLAIN_SIZE: usize = 71;
+const MAX_AUTH_PLAIN: usize = 256;
+const MAX_SHARE_PADDING: usize = 255;
 const CLIENT_TO_SERVER_LABEL: &[u8] = b"mio c2s";
 const SERVER_TO_CLIENT_LABEL: &[u8] = b"mio s2c";
 pub const X25519_SIZE: usize = 32;
@@ -114,21 +118,7 @@ pub fn auth_key(shared: &[u8; 32], client_random: &[u8], server_random: &[u8]) -
     Ok(AeadKey::new(&hkdf_key(shared, &salt, AUTH_INFO)?))
 }
 
-/// Build the TLS Application Data record carrying the client's hybrid key share.
-pub fn auth_record(
-    shared: &[u8; 32],
-    client_random: &[u8],
-    server_random: &[u8],
-    share: &[u8],
-) -> Result<Vec<u8>> {
-    let aead = auth_key(shared, client_random, server_random)?;
-    let padding_length = OsRng.gen_range(32..=1024);
-    let mut plain = Vec::with_capacity(share.len() + padding_length);
-    plain.extend_from_slice(share);
-    let mut padding = vec![0_u8; padding_length];
-    OsRng.fill_bytes(&mut padding);
-    plain.extend_from_slice(&padding);
-
+fn seal_record(aead: &AeadKey, sequence: u64, plain: &[u8]) -> Result<Vec<u8>> {
     let body_length = plain.len() + AEAD_OVERHEAD;
     if body_length > max_record_body() {
         bail!("authentication record is too large");
@@ -140,14 +130,32 @@ pub fn auth_record(
         (body_length >> 8) as u8,
         body_length as u8,
     ];
-    let body = aead.seal(&[0_u8; 12], &plain, &header);
+    let body = aead.seal(&nonce_for_sequence(sequence), plain, &header);
     let mut record = Vec::with_capacity(RECORD_HEADER_SIZE + body.len());
     record.extend_from_slice(&header);
     record.extend_from_slice(&body);
     Ok(record)
 }
 
-/// Verify an authentication record with the server static key and the TLS X25519 share.
+/// Build the two TLS Application Data records sent immediately after the handshake.
+pub fn auth_records(
+    shared: &[u8; 32],
+    client_random: &[u8],
+    server_random: &[u8],
+    share: &[u8],
+) -> Result<Vec<u8>> {
+    let aead = auth_key(shared, client_random, server_random)?;
+    let auth_plain = random_bytes(AUTH_PLAIN_SIZE);
+    let padding_length = OsRng.gen_range(0..=MAX_SHARE_PADDING);
+    let mut share_plain = Vec::with_capacity(share.len() + padding_length);
+    share_plain.extend_from_slice(share);
+    share_plain.extend_from_slice(&random_bytes(padding_length));
+    let mut records = seal_record(&aead, 0, &auth_plain)?;
+    records.extend_from_slice(&seal_record(&aead, 1, &share_plain)?);
+    Ok(records)
+}
+
+/// Verify the authentication record and return the X25519 static shared key.
 pub fn verify_auth(
     server_private: &StaticSecret,
     client_key_share: &[u8; 32],
@@ -155,15 +163,38 @@ pub fn verify_auth(
     server_random: &[u8],
     header: &[u8],
     body: &[u8],
-) -> Option<([u8; 32], Vec<u8>)> {
+) -> Option<[u8; 32]> {
     let peer = PublicKey::from(*client_key_share);
     let shared = x25519_shared(server_private, &peer);
     let aead = auth_key(&shared, client_random, server_random).ok()?;
-    let plain = aead.open(&[0_u8; 12], body, header).ok()?;
-    if plain.len() < CLIENT_SHARE_SIZE + 32 || plain.len() > CLIENT_SHARE_SIZE + 1024 {
-        return None;
+    let plain = aead.open(&nonce_for_sequence(0), body, header).ok()?;
+    (plain.len() <= MAX_AUTH_PLAIN).then_some(shared)
+}
+
+/// Read the share record following authentication and return the client's hybrid share.
+pub fn read_share<R: Read>(
+    reader: &mut R,
+    shared: &[u8; 32],
+    client_random: &[u8],
+    server_random: &[u8],
+) -> Result<Vec<u8>> {
+    let aead = auth_key(shared, client_random, server_random)?;
+    let mut header = [0_u8; RECORD_HEADER_SIZE];
+    reader.read_exact(&mut header)?;
+    if header[0] != RECORD_APPDATA || header[1] != 0x03 {
+        bail!("invalid share record header");
     }
-    Some((shared, plain[..CLIENT_SHARE_SIZE].to_vec()))
+    let body_length = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if body_length > max_record_body() {
+        bail!("share record is too large");
+    }
+    let mut body = vec![0_u8; body_length];
+    reader.read_exact(&mut body)?;
+    let plain = aead.open(&nonce_for_sequence(1), &body, &header)?;
+    if plain.len() < CLIENT_SHARE_SIZE {
+        bail!("share record is too short");
+    }
+    Ok(plain[..CLIENT_SHARE_SIZE].to_vec())
 }
 
 pub struct ClientKeys {
@@ -313,10 +344,11 @@ mod tests {
         let client_random = [7_u8; 32];
         let server_random = [9_u8; 32];
         let keys = ClientKeys::generate();
-        let record = auth_record(&shared, &client_random, &server_random, &keys.share()).unwrap();
-        let header = &record[..RECORD_HEADER_SIZE];
-        let body = &record[RECORD_HEADER_SIZE..];
-        let (verified_shared, share) = verify_auth(
+        let records = auth_records(&shared, &client_random, &server_random, &keys.share()).unwrap();
+        let first_length = RECORD_HEADER_SIZE + AUTH_PLAIN_SIZE + AEAD_OVERHEAD;
+        let header = &records[..RECORD_HEADER_SIZE];
+        let body = &records[RECORD_HEADER_SIZE..first_length];
+        let verified_shared = verify_auth(
             &server_private,
             client_public.as_bytes(),
             &client_random,
@@ -326,6 +358,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verified_shared, shared);
+        let mut rest = &records[first_length..];
+        let share = read_share(&mut rest, &shared, &client_random, &server_random).unwrap();
         assert_eq!(share, keys.share());
     }
 }

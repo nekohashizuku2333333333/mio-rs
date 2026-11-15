@@ -86,36 +86,60 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn is_server(&self) -> bool {
+    pub fn has_server(&self) -> bool {
         !self.inbounds.listen.trim().is_empty()
+            || self.inbounds.listen_port != 0
+            || !self.inbounds.dest.trim().is_empty()
+            || !self.inbounds.private_key.is_empty()
+    }
+
+    pub fn has_client(&self) -> bool {
+        !self.outbounds.socks_listen.trim().is_empty()
+            || self.outbounds.socks_listen_port != 0
+            || !self.outbounds.server.trim().is_empty()
+            || !self.outbounds.public_key.is_empty()
+    }
+
+    pub fn is_server(&self) -> bool {
+        self.has_server()
     }
 
     pub fn validate(&self) -> Result<()> {
         validate_log_level(&self.log.level)?;
-        if self.is_server() {
-            if !self.outbounds.socks_listen.trim().is_empty()
-                || !self.outbounds.server.trim().is_empty()
-            {
-                bail!("configure either a server ([inbounds]) or a client ([outbounds]), not both");
-            }
-            let inbound = &self.inbounds;
-            if inbound.listen_port == 0 {
-                bail!("[inbounds].listen_port must be between 1 and 65535");
-            }
-            if inbound.dest.trim().is_empty() {
-                bail!("configuration must set [inbounds].dest");
-            }
-            if inbound.dest_port == 0 {
-                bail!("[inbounds].dest_port must be between 1 and 65535");
-            }
-            if inbound.private_key.is_empty() {
-                bail!("configuration must set [inbounds].private_key (run `mio keygen`)");
-            }
-            crate::crypto::parse_private_key(&inbound.private_key)
-                .context("[inbounds].private_key")?;
-            return Ok(());
+        if !self.has_server() && !self.has_client() {
+            bail!("configuration must set [outbounds] (client), [inbounds] (server), or both");
         }
+        if self.has_server() {
+            self.validate_server()?;
+        }
+        if self.has_client() {
+            self.validate_client()?;
+        }
+        Ok(())
+    }
 
+    fn validate_server(&self) -> Result<()> {
+        let inbound = &self.inbounds;
+        if inbound.listen.trim().is_empty() {
+            bail!("configuration must set [inbounds].listen");
+        }
+        if inbound.listen_port == 0 {
+            bail!("[inbounds].listen_port must be between 1 and 65535");
+        }
+        if inbound.dest.trim().is_empty() {
+            bail!("configuration must set [inbounds].dest");
+        }
+        if inbound.dest_port == 0 {
+            bail!("[inbounds].dest_port must be between 1 and 65535");
+        }
+        if inbound.private_key.is_empty() {
+            bail!("configuration must set [inbounds].private_key (run `mio keygen`)");
+        }
+        crate::crypto::parse_private_key(&inbound.private_key).context("[inbounds].private_key")?;
+        Ok(())
+    }
+
+    fn validate_client(&self) -> Result<()> {
         let outbound = &self.outbounds;
         if outbound.socks_listen.trim().is_empty() {
             bail!("configuration must set [outbounds].socks_listen");
@@ -165,6 +189,30 @@ pub fn validate_log_level(level: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_and_server_can_coexist() {
+        let config: Config = toml::from_str(
+            r#"
+            [outbounds]
+            socks_listen = "127.0.0.1"
+            socks_listen_port = 1080
+            server = "127.0.0.1"
+            dest = "example.com"
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+            [inbounds]
+            listen = "127.0.0.1"
+            listen_port = 1443
+            dest = "example.com"
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.has_client());
+        assert!(config.has_server());
+    }
 
     #[test]
     fn client_config_validation() {
