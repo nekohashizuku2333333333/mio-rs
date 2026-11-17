@@ -523,11 +523,20 @@ fn open_tcp_stream(session: &Session, target: &str) -> Result<Stream> {
         let _ = stream.close();
         return Err(error);
     }
+    let started = session.last_recv_nanos();
     stream.set_read_timeout(Some(REPLY_TIMEOUT));
     let connected = match protocol::read_reply(&mut stream) {
         Ok(connected) => connected,
         Err(error) => {
             let _ = stream.close();
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+            }) && session.last_recv_nanos() <= started
+            {
+                session.close();
+            }
             return Err(error);
         }
     };

@@ -92,9 +92,9 @@ fn run() -> Result<()> {
             println!("canonical_ja3={}", summary.canonical_ja3);
             println!("canonical_ja3_md5={}", summary.canonical_ja3_md5);
             println!(
-                "chrome_133_match={}",
-                summary.canonical_ja3_md5 == tls::CHROME_133_CANONICAL_JA3_MD5
-                    && summary.ja4 == tls::CHROME_133_JA4
+                "chrome_156_match={}",
+                summary.canonical_ja3_md5 == tls::CHROME_156_CANONICAL_JA3_MD5
+                    && summary.ja4 == tls::CHROME_156_JA4
             );
             println!(
                 "cipher_suites={}",

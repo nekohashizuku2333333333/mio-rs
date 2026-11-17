@@ -60,47 +60,84 @@ pub fn write_all<W: Write>(writer: &mut W, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// How a relay should handle one TLS record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordAction {
+    /// Forward the record and keep parsing later records.
+    Forward,
+    /// Consume the record as a mio authentication record and stop relaying.
+    Claim,
+    /// Forward the record and relay the remaining bytes without parsing.
+    Passthrough,
+}
+
+/// Why `copy_records` stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOutcome {
+    /// The source ended cleanly (including after a partial final record).
+    EndOfStream,
+    /// The callback claimed a record as mio authentication.
+    Claimed,
+}
+
 /// Forward raw TLS records until the callback consumes one as a mio authentication record.
-pub fn copy_records<R: Read, W: Write, F: FnMut(&[u8], &[u8]) -> bool>(
+pub fn copy_records<R: Read, W: Write, F: FnMut(&[u8], &[u8]) -> RecordAction>(
     destination: &mut W,
     source: &mut BufReader<R>,
     mut inspect: F,
-) -> io::Result<bool> {
+) -> io::Result<CopyOutcome> {
     let mut header = [0_u8; RECORD_HEADER_SIZE];
     loop {
-        match source.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-            Err(error) => return Err(error),
+        let (read, error) = read_up_to(source, &mut header);
+        if read != header.len() {
+            if read > 0 {
+                destination.write_all(&header[..read])?;
+            }
+            return match error {
+                Some(error) => Err(error),
+                None => Ok(CopyOutcome::EndOfStream),
+            };
         }
         let length = u16::from_be_bytes([header[3], header[4]]) as usize;
         if !valid_record_header(&header, length) {
             destination.write_all(&header)?;
             io::copy(source, destination)?;
-            return Ok(false);
+            return Ok(CopyOutcome::EndOfStream);
         }
 
         let mut record = vec![0_u8; RECORD_HEADER_SIZE + length];
         record[..RECORD_HEADER_SIZE].copy_from_slice(&header);
-        let mut read = 0;
-        while read < length {
-            match source.read(&mut record[RECORD_HEADER_SIZE + read..]) {
-                Ok(0) => {
-                    destination.write_all(&record[..RECORD_HEADER_SIZE + read])?;
-                    return Ok(false);
-                }
-                Ok(count) => read += count,
-                Err(error) => {
-                    destination.write_all(&record[..RECORD_HEADER_SIZE + read])?;
-                    return Err(error);
-                }
-            }
+        let (read, error) = read_up_to(source, &mut record[RECORD_HEADER_SIZE..]);
+        if read != length {
+            destination.write_all(&record[..RECORD_HEADER_SIZE + read])?;
+            return match error {
+                Some(error) => Err(error),
+                None => Ok(CopyOutcome::EndOfStream),
+            };
         }
-        if inspect(&header, &record[RECORD_HEADER_SIZE..]) {
-            return Ok(true);
+        let action = inspect(&header, &record[RECORD_HEADER_SIZE..]);
+        if action == RecordAction::Claim {
+            return Ok(CopyOutcome::Claimed);
         }
         destination.write_all(&record)?;
+        if action == RecordAction::Passthrough {
+            io::copy(source, destination)?;
+            return Ok(CopyOutcome::EndOfStream);
+        }
     }
+}
+
+fn read_up_to<R: Read>(source: &mut R, buffer: &mut [u8]) -> (usize, Option<io::Error>) {
+    let mut read = 0;
+    while read < buffer.len() {
+        match source.read(&mut buffer[read..]) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return (read, Some(error)),
+        }
+    }
+    (read, None)
 }
 
 pub trait CloseWrite {
@@ -270,5 +307,58 @@ mod tests {
         assert_eq!(record_length(&record), Some(9));
         record[3..5].copy_from_slice(&u16::MAX.to_be_bytes());
         assert_eq!(record_length(&record), None);
+    }
+
+    #[test]
+    fn copy_records_claim_and_passthrough() {
+        let claimed = vec![RECORD_APPDATA, 3, 3, 0, 1, 9];
+        let mut output = Vec::new();
+        let outcome = copy_records(
+            &mut output,
+            &mut BufReader::new(claimed.as_slice()),
+            |_, _| RecordAction::Claim,
+        )
+        .unwrap();
+        assert_eq!(outcome, CopyOutcome::Claimed);
+        assert!(output.is_empty());
+
+        let records = [
+            RECORD_APPDATA,
+            3,
+            3,
+            0,
+            1,
+            1,
+            RECORD_APPDATA,
+            3,
+            3,
+            0,
+            2,
+            2,
+            3,
+        ];
+        let mut output = Vec::new();
+        let outcome = copy_records(
+            &mut output,
+            &mut BufReader::new(records.as_slice()),
+            |_, _| RecordAction::Passthrough,
+        )
+        .unwrap();
+        assert_eq!(outcome, CopyOutcome::EndOfStream);
+        assert_eq!(output, records);
+    }
+
+    #[test]
+    fn copy_records_preserves_partial_final_record() {
+        let partial = [RECORD_APPDATA, 3, 3, 0, 8, 1, 2];
+        let mut output = Vec::new();
+        let outcome = copy_records(
+            &mut output,
+            &mut BufReader::new(partial.as_slice()),
+            |_, _| RecordAction::Forward,
+        )
+        .unwrap();
+        assert_eq!(outcome, CopyOutcome::EndOfStream);
+        assert_eq!(output, partial);
     }
 }

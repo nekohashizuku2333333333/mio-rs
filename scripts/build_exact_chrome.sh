@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuild the release binary against the vendored, pre-patched BoringSSL.
-# The vendor tree provides both Chrome 133 sigalg shape and the v0.5.3
+# The vendor tree provides both Chrome 156+ sigalg shape and the v0.5.6
 # ClientHello X25519 key_share private-key getter.
 set -euo pipefail
 
@@ -13,7 +13,7 @@ if ! grep -q 'SSL_get_x25519_key_share_private_key' \
   echo "vendor/boringssl is missing the X25519 key-share patch" >&2
   exit 1
 fi
-if ! grep -q 'Chrome 133 does not put GREASE' \
+if ! grep -q 'Chrome 156+ prepends a GREASE' \
   "$ROOT/vendor/boringssl/ssl/extensions.cc"; then
   echo "vendor/boringssl is missing the Chrome sigalg patch" >&2
   exit 1

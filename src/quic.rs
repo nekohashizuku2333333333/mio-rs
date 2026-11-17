@@ -24,8 +24,8 @@ use crate::udp_demux::UdpDemuxSocket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const QUIC_EXPORTER_LABEL: &[u8] = b"mio quic auth";
-const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.5.3";
-const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.3";
+const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.5.6";
+const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.6";
 const QUIC_CLIENT_LABEL: &[u8] = b"client";
 const QUIC_SERVER_LABEL: &[u8] = b"server";
 const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -448,7 +448,12 @@ pub fn run_server(config: InboundConfig, stop: Arc<AtomicBool>) -> Result<()> {
         .build()
         .context("create QUIC server runtime")?;
     runtime.block_on(async move {
-        let destination = resolve_udp(&config.dest, config.dest_port).ok();
+        let dest_port = if config.dest_port == 0 {
+            config.listen_port
+        } else {
+            config.dest_port
+        };
+        let destination = resolve_udp(&config.dest, dest_port).ok();
         let socket = UdpDemuxSocket::bind(address, public_key, destination, stop.clone())
             .await
             .context("bind UDP demux socket")?;

@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "mio-rs"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -884,6 +884,7 @@ dependencies = [
  "serde",
  "sha2",
  "simplelog",
+ "socket2",
  "thiserror",
  "tokio",
  "toml",

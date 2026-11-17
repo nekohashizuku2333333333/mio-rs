@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -41,6 +41,7 @@ struct SessionInner {
     accept_tx: SyncSender<Arc<StreamState>>,
     accept_rx: Mutex<mpsc::Receiver<Arc<StreamState>>>,
     started: AtomicBool,
+    last_recv: AtomicI64,
     open_mu: Mutex<()>,
     client: bool,
 }
@@ -135,6 +136,7 @@ impl Session {
             accept_tx,
             accept_rx: Mutex::new(accept_rx),
             started: AtomicBool::new(false),
+            last_recv: AtomicI64::new(0),
             open_mu: Mutex::new(()),
             client,
         });
@@ -240,6 +242,10 @@ impl Session {
         state.streams.len() + state.unopened
     }
 
+    pub fn last_recv_nanos(&self) -> i64 {
+        self.inner.last_recv.load(Ordering::Acquire)
+    }
+
     pub fn close(&self) {
         self.inner.close_with_error("session closed");
     }
@@ -281,6 +287,7 @@ impl SessionInner {
                 }
             };
             recv.sequence += 1;
+            self.last_recv.store(monotonic_nanos(), Ordering::Release);
             if plain.len() < FRAME_HEADER_SIZE {
                 bail!("short encrypted frame");
             }
@@ -585,6 +592,13 @@ impl Write for Stream {
     }
 }
 
+fn monotonic_nanos() -> i64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as i64
+}
+
 fn default_padding(data_frames: u64, payload: usize) -> usize {
     if data_frames < 8 && payload < 900 {
         let minimum = 900usize.saturating_sub(FRAME_HEADER_SIZE + payload);
@@ -678,6 +692,7 @@ impl SessionInner {
                 }
             };
             recv.sequence += 1;
+            self.last_recv.store(monotonic_nanos(), Ordering::Release);
             if plain.len() < FRAME_HEADER_SIZE {
                 bail!("short encrypted frame");
             }

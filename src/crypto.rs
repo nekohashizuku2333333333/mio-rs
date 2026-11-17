@@ -13,8 +13,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::protocol::{RECORD_APPDATA, RECORD_HEADER_SIZE, max_record_body};
 
-pub const PROTOCOL_VERSION: &str = "0.5.3";
-const AUTH_INFO: &[u8] = b"mio auth 0.5.3";
+pub const PROTOCOL_VERSION: &str = "0.5.6";
+const AUTH_INFO: &[u8] = b"mio auth 0.5.6";
 pub const AUTH_PLAIN_SIZE: usize = 71;
 const MAX_AUTH_PLAIN: usize = 256;
 const MAX_SHARE_PADDING: usize = 255;
@@ -164,6 +164,9 @@ pub fn verify_auth(
     header: &[u8],
     body: &[u8],
 ) -> Option<[u8; 32]> {
+    if !(16..=MAX_AUTH_PLAIN + AEAD_OVERHEAD).contains(&body.len()) {
+        return None;
+    }
     let peer = PublicKey::from(*client_key_share);
     let shared = x25519_shared(server_private, &peer);
     let aead = auth_key(&shared, client_random, server_random).ok()?;

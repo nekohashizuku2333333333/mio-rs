@@ -1,23 +1,23 @@
 # mio-rs
 
-`mio-rs` 是 [orgmio/mio](https://github.com/orgmio/mio) v0.5.5 的 Rust 重写。它实现：
+`mio-rs` 是 [orgmio/mio](https://github.com/orgmio/mio) v0.5.6 的 Rust 重写。它实现：
 
 - TCP 伪装站点转发、静态 X25519 认证、X25519MLKEM768 会话密钥交换
 - TCP 上的多路复用 stream、per-stream 流控、close/reset/window 帧
 - QUIC 同端口 UDP marker 分流、静态密钥双向证明、stream 代理
 - SOCKS5 `CONNECT` 客户端
-- Chrome 133 TCP ClientHello 指纹
+- Chrome 156+ TCP ClientHello 指纹（uTLS Chrome 133 扩展集 + ML-DSA sigalgs）
 - TCP/QUIC 并行探测、延迟选择、10–30 分钟重新探测和自动回退
 - Quinn 实验性 BBR，初始窗口 `32 × MTU`
 
-二进制版本是 `0.5.5`，线上协议版本是 `0.5.3`。协议版本参与 TCP auth label、QUIC
+二进制版本是 `0.5.6`，线上协议版本是 `0.5.6`。协议版本参与 TCP auth label、QUIC
 marker 和 QUIC auth key 派生；客户端和服务端必须使用相同的协议版本。
 
 ## 状态
 
 | 功能 | 状态 |
 | --- | --- |
-| mio v0.5.3 TCP 两条认证记录、ready、混合密钥交换 | 已实现 |
+| mio v0.5.6 TCP 两条认证记录、ready、混合密钥交换 | 已实现 |
 | 服务端 TCP 伪装转发与认证接管 | 已实现 |
 | TCP 多路复用会话、stream id、window/close/reset | 已实现 |
 | 服务端 QUIC UDP marker 分流 | 已实现 |
@@ -25,7 +25,7 @@ marker 和 QUIC auth key 派生；客户端和服务端必须使用相同的协�
 | QUIC exporter HMAC 静态密钥认证 | 已实现 |
 | SOCKS5 客户端 | 已实现 |
 | TCP/QUIC 并行探测与回退 | 已实现 |
-| Chrome 133 TCP ClientHello | JA4/canonical JA3/raw 长度均匹配 |
+| Chrome 156+ TCP ClientHello | JA4/canonical JA3 匹配；含 GREASE + ML-DSA sigalgs |
 | QUIC TLS 指纹 | Quinn/rustls，不是 Chrome |
 | BBR | Quinn 实验性 BBR，非上游逐行移植 |
 
@@ -51,10 +51,10 @@ CARGO_HOME="$PWD/.cargo-home" cargo build --release
 源码基于 `boring-sys 5.4.0`，已按顺序应用：
 
 1. `boring-pq.patch`（Cloudflare PQ 支持）
-2. `patches/boringssl-no-sigalg-grease.patch`（Chrome 133 sigalg shape）
+2. `patches/boringssl-no-sigalg-grease.patch`（Chrome 156+ sigalg shape）
 3. `patches/boringssl-x25519-key-share.patch`（导出 ClientHello X25519 私钥）
 
-第三项是 v0.5.3 所必需的：上游用 TLS ClientHello 里的 X25519 key_share 私钥与
+第三项是 v0.5.6 所必需的：上游用 TLS ClientHello 里的 X25519 key_share 私钥与
 服务端静态公钥计算认证共享密钥，stock BoringSSL 不提供该私钥。
 
 重新构建内置 BoringSSL：
@@ -93,7 +93,6 @@ socks_listen_port = 1080
 server = "example.com"
 server_port = 443
 dest = "www.example.com"
-dest_port = 443
 public_key = "mio keygen 生成的 PublicKey"
 ```
 
@@ -110,11 +109,10 @@ timestamp = true
 listen = "0.0.0.0"
 listen_port = 443
 dest = "www.example.com"
-dest_port = 443
 private_key = "mio keygen 生成的 PrivateKey"
 ```
 
-`dest` 必须与客户端一致。服务端 TCP 和 UDP 使用同一个 `listen_port`。同时配置
+`dest` 必须与客户端一致。服务端 `dest_port` 可选，缺省时等于 `listen_port`；TCP 和 UDP 使用同一个 `listen_port`。同时配置
 `[outbounds]` 和 `[inbounds]` 时，`mio run` 会同时启动客户端与服务端。
 
 运行：
@@ -136,7 +134,7 @@ private_key = "mio keygen 生成的 PrivateKey"
 3. 客户端连续发送两条 TLS Application Data 记录：
    - 认证记录：nonce 0，71 字节随机明文；
    - 份额记录：nonce 1，`share(1216) ‖ padding(0–255)`。
-   - key 为 `HKDF(shared, client_random‖server_random, "mio auth 0.5.3")`，header
+   - key 为 `HKDF(shared, client_random‖server_random, "mio auth 0.5.6")`，header
      作为 AAD。
 4. 服务端校验认证记录，再读取份额记录；生成 X25519MLKEM768 服务端份额，用初始
    会话密钥发出 ready 帧，最后切换到包含混合 secret 的会话密钥。
@@ -150,7 +148,7 @@ private_key = "mio keygen 生成的 PrivateKey"
 - 合法 marker 交给 Quinn；未标记 UDP 流按客户端地址转发到 `dest` 并回传响应。
 - 握手后首个 stream：客户端临时 X25519 公钥 + 客户端 HMAC；服务端返回服务端 HMAC。
 - HMAC key 由静态 X25519 shared 与 TLS exporter 通过
-  `"mio quic auth 0.5.3"` 派生。
+  `"mio quic auth 0.5.6"` 派生。
 
 完整线上格式见 [docs/protocol.md](docs/protocol.md)。
 
@@ -165,9 +163,9 @@ private_key = "mio keygen 生成的 PrivateKey"
 预期输出：
 
 ```text
-ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd
+ja4=t13d1516h2_8daaf6152771_806a8c22fdea
 canonical_ja3_md5=8e19337e7524d2573be54efb2b0784c9
-chrome_133_match=true
+chrome_156_match=true
 ```
 
 扩展顺序和 GREASE 值按连接随机，逐连接原始 JA3 MD5 不稳定是 Chrome/uTLS 的正常行为。
@@ -191,7 +189,7 @@ python3 scripts/udp_relay_local.py
 - TCP 多 stream 会话复用
 - Chrome ClientHello 离线回归
 - 未标记 UDP 伪装转发
-- Rust 客户端 ↔ Go v0.5.5 服务端的 TCP/QUIC 互操作
+- Rust 客户端 ↔ Go v0.5.6 服务端的 TCP/QUIC 互操作
 
 结果：
 
@@ -199,9 +197,9 @@ python3 scripts/udp_relay_local.py
 cargo test                         11 unit + 2 fingerprint regression PASS
 scripts/e2e_local.py               Rust client/server two-request session PASS
 scripts/udp_relay_local.py         UDP camouflage relay PASS
-Rust client -> Go v0.5.5 server     TCP + QUIC PASS
-Go v0.5.5 client -> Rust server     TCP + QUIC PASS
-Go v0.5.5 two streams on one TCP    PASS
+Rust client -> Go v0.5.6 server     TCP + QUIC PASS
+Go v0.5.6 client -> Rust server     TCP + QUIC PASS
+Go v0.5.6 two streams on one TCP    PASS
 ```
 
 ## 目录
@@ -209,12 +207,12 @@ Go v0.5.5 two streams on one TCP    PASS
 - `src/tls.rs`：Chrome ClientHello、BoringSSL 握手边界、私钥导出和指纹解析
 - `src/crypto.rs`：静态密钥、HKDF、AES-GCM、X25519MLKEM768
 - `src/protocol.rs`：TLS record、请求/应答和 relay helper
-- `src/session.rs`：v0.5.3 多路复用流、window/close/reset 帧和 TCP 记录层
+- `src/session.rs`：v0.5.6 多路复用流、window/close/reset 帧和 TCP 记录层
 - `src/client.rs`：SOCKS5、TCP session pool、TCP/QUIC 探测和回退
 - `src/server.rs`：伪装转发、静态认证接管、stream 代理
 - `src/quic.rs`：Quinn、BBR、QUIC marker/proof 和 stream 代理
 - `src/udp_demux.rs`：QUIC Initial 解析、UDP 分流和伪装 relay
-- `src/config.rs`：v0.5.5 严格 TOML 配置
+- `src/config.rs`：v0.5.6 严格 TOML 配置
 
 ## 已知差异
 

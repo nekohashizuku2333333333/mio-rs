@@ -27,7 +27,7 @@ pub struct ClientHelloProfile {
 
 pub const CHROME_PROFILE: ClientHelloProfile = ClientHelloProfile {
     name: "Chrome",
-    browser_version: "133",
+    browser_version: "156+",
 };
 
 pub struct TlsHandshake {
@@ -172,6 +172,8 @@ fn chrome_ssl(context: &SslContext, server_name: &str, insecure: bool) -> Result
         if settings != 1 {
             bail!("enable ALPS application settings");
         }
+        // Upstream builds on uTLS Chrome 133 and prepends the Chrome 156+
+        // signature schemes. Keep the extension set aligned with that profile.
         let key_shares = [0x11ec_u16, 29];
         let configured =
             ffi::SSL_set1_client_key_shares(ssl.as_ptr(), key_shares.as_ptr(), key_shares.len());
@@ -535,9 +537,9 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
 
 const RECORD_HANDSHAKE: u8 = 0x16;
 const HANDLER_CLIENT_HELLO: u8 = 0x01;
-pub const CHROME_133_CANONICAL_JA3: &str = "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-5-10-11-13-16-18-23-27-35-43-45-51-17613-65037-65281,4588-29-23-24,0";
-pub const CHROME_133_CANONICAL_JA3_MD5: &str = "8e19337e7524d2573be54efb2b0784c9";
-pub const CHROME_133_JA4: &str = "t13d1516h2_8daaf6152771_d8a2da3f94cd";
+pub const CHROME_156_CANONICAL_JA3: &str = "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-5-10-11-13-16-18-23-27-35-43-45-51-17613-65037-65281,4588-29-23-24,0";
+pub const CHROME_156_CANONICAL_JA3_MD5: &str = "8e19337e7524d2573be54efb2b0784c9";
+pub const CHROME_156_JA4: &str = "t13d1516h2_8daaf6152771_806a8c22fdea";
 
 fn ja3(cipher_suites: &[u16], extensions: &[u16], groups: &[u16], points: &[u8]) -> String {
     let ciphers = cipher_suites

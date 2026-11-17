@@ -1051,11 +1051,16 @@ static bool ext_sigalgs_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
       !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb)) {
     return false;
   }
-  // Chrome 133 does not put GREASE in signature_algorithms. Keep the global
-  // GREASE toggle for all other Chrome GREASE values, but skip this one.
-  if (false && hs->ssl->ctx->grease_enabled &&
+  // Chrome 156+ prepends a GREASE value and the three ML-DSA schemes to
+  // signature_algorithms. The GREASE value is randomized per ClientHello.
+  if (hs->ssl->ctx->grease_enabled &&
       !CBB_add_u16(&sigalgs_cbb,
                    ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
+    return false;
+  }
+  if (!CBB_add_u16(&sigalgs_cbb, SSL_SIGN_ML_DSA_44) ||
+      !CBB_add_u16(&sigalgs_cbb, SSL_SIGN_ML_DSA_65) ||
+      !CBB_add_u16(&sigalgs_cbb, SSL_SIGN_ML_DSA_87)) {
     return false;
   }
   if (!tls12_add_verify_sigalgs(hs, &sigalgs_cbb) ||

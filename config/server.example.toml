@@ -8,5 +8,4 @@ timestamp = true
 listen = "0.0.0.0"
 listen_port = 443
 dest = "www.example.com"
-dest_port = 443
 private_key = "replace-with-mio-keygen-PrivateKey"

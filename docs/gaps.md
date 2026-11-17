@@ -1,6 +1,6 @@
-# v0.5.3 差异补全与可行性研究
+# v0.5.6 差异补全与可行性研究
 
-本文记录 Rust 重写与上游 `orgmio/mio` v0.5.5（线上协议 v0.5.3）的逐项差异。
+本文记录 Rust 重写与上游 `orgmio/mio` v0.5.6（线上协议 v0.5.6）的逐项差异。
 
 ## 总览
 
@@ -11,14 +11,14 @@
 | 双认证记录 | 已补全 | 认证记录 nonce 0 + 份额记录 nonce 1 |
 | 服务端 QUIC UDP 分流 | 已补全 | 公钥派生 marker、replay cache、未标记 UDP relay |
 | 客户端 TCP/QUIC 并行探测 | 已补全 | 首请求并行、平滑延迟、10–30 分钟重新探测 |
-| 原始 ClientHello sigalg GREASE | 已补全 | vendored BoringSSL，默认构建即匹配 |
+| Chrome 156+ sigalgs | 已补全 | GREASE + ML-DSA-44/65/87，vendored BoringSSL |
 | BoringSSL ClientHello 私钥导出 | 已补全 | 自定义补丁，支持 HRR/config shedding |
 | QUIC BBR | 已启用 | Quinn 0.11.19 内置实验性 BBR，非上游逐行移植 |
 | QUIC TLS 指纹 | 保留差异 | 上游 QUIC 使用 Go crypto/tls，非 uTLS Chrome |
 
 ## TCP 静态认证
 
-v0.5.3 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
+v0.5.6 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
 
 ```text
 shared = X25519(client TLS key_share private, server static public)
@@ -28,7 +28,7 @@ shared = X25519(client TLS key_share private, server static public)
 握手后客户端连续发送两条记录：
 
 ```text
-key       = HKDF(shared, client_random ‖ server_random, "mio auth 0.5.3")
+key       = HKDF(shared, client_random ‖ server_random, "mio auth 0.5.6")
 认证记录: nonce = 0，plaintext = random_padding(71)
 份额记录: nonce = 1，plaintext = client_share(1216) ‖ random_padding(0–255)
 header    = 17 03 03 ‖ length
@@ -44,7 +44,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 
 ## TCP 多路复用
 
-`src/session.rs` 实现 v0.5.3 `Session`：
+`src/session.rs` 实现 v0.5.6 `Session`：
 
 - 帧头：`type(1) ‖ stream_id(4) ‖ payload_length(2)`
 - ready/data/close/reset/window 五种帧
@@ -53,7 +53,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 - 客户端 pool 尽量复用同一条 TCP session，达到 100 条流后再新建
 - 每条流的读写独立阻塞，不阻塞同一 session 的其他流
 
-本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.5.5 客户端到 Rust 服务端
+本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.5.6 客户端到 Rust 服务端
 也通过了同一条 TCP 连接上的两条流。
 
 ## 服务端 QUIC UDP 分流
@@ -64,7 +64,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 2. 对每个 UDP 源地址维护 `Pending / Mio / Relay` 流状态。
 3. 解密 QUIC v1 Initial 并读取 ClientHello.random。
 4. marker key 由服务端静态公钥经
-   `HKDF(public_key, empty_salt, "mio quic marker 0.5.3")` 派生。
+   `HKDF(public_key, empty_salt, "mio quic marker 0.5.6")` 派生。
 5. 验证 16 字节 nonce + 16 字节分钟级 HMAC，接受当前分钟 ±1 分钟。
 6. 用 replay cache 拒绝重复 marker。
 7. 无 marker 的流按客户端地址建立到 `dest` 的 UDP relay，响应从同一服务端
@@ -79,11 +79,12 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 - 保存两条线路的平滑建立延迟；后续选择更快线路。
 - 随机 10–30 分钟后重新探测。
 - QUIC stream 传输失败时回退 TCP。
+- TCP 请求 reply 超时且整个会话期间没有收到任何记录时，关闭该僵死 session。
 - TCP 使用 session pool，多个代理连接复用同一条 TCP 连接。
 
 验证：占用服务端 UDP 端口强制 QUIC bind 失败后，SOCKS5 echo 仍成功并选择 TCP。
 
-## BoringSSL 与 Chrome 133
+## BoringSSL 与 Chrome 156+
 
 `vendor/boringssl` 基于 `boring-sys 5.4.0`，预应用：
 
@@ -93,11 +94,15 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 
 默认构建同时满足：
 
-- JA4 `t13d1516h2_8daaf6152771_d8a2da3f94cd`
+- JA4 `t13d1516h2_8daaf6152771_806a8c22fdea`
 - canonical JA3 MD5 `8e19337e7524d2573be54efb2b0784c9`
 - raw ClientHello 与 uTLS 的固定长度一致（ECH body 282 时为 1817 bytes）
 
-扩展顺序仍然随机，逐连接 JA3 MD5 不稳定是 Chrome 本身行为。
+扩展顺序仍然随机，逐连接 JA3 MD5 不稳定是 Chrome 本身行为。上游在 uTLS Chrome 133
+扩展集上给 `signature_algorithms` 前置 GREASE + ML-DSA-44/65/87；Rust 的 vendored
+BoringSSL 同步该形状。真实 Chrome 156/158 还发送 `trust_anchors (0xca34)`，上游没有
+该扩展，因此本实现的 JA4 为 `..._806a8c22fdea`（16 个非 GREASE 扩展），而不是当前
+浏览器捕获的 `..._cb7bf5808d99`（17 个）。
 
 ## QUIC BBR
 

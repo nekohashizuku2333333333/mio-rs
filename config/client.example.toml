@@ -10,7 +10,6 @@ socks_listen_port = 1080
 server = "example.com"
 server_port = 443
 dest = "www.example.com"
-dest_port = 443
 public_key = "replace-with-mio-keygen-PublicKey"
-# Local test only; upstream v0.5.5 does not have this field.
+# Local test only; upstream v0.5.6 does not have this field.
 # insecure = true

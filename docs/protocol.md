@@ -28,7 +28,7 @@ mio 不使用密码：所有认证用的密钥都来自 X25519 共享密钥，�
 ### 借用伪装站完成 TLS 握手
 
 1. 客户端用 Chrome 指纹（uTLS）向服务端发起 TLS 握手，SNI 为 `dest`。
-2. 服务端为每个入站连接拨号 `dest:dest_port`，按 TLS 记录双向原样转发，同时记下：
+2. 服务端为每个入站连接拨号 `dest:dest_port`（`dest_port` 缺省时等于 `listen_port`），按 TLS 记录双向原样转发，同时记下：
    - `client_random`：ClientHello 的 random（32 字节）。
    - `E_pub`：ClientHello 里 `key_share` 扩展中 X25519（group `0x001d`）的份额（32 字节）。
    - `server_random`：最后一条 ServerHello 的 random（出现 HelloRetryRequest 时以最后一条为准）。
@@ -59,10 +59,12 @@ record = header ‖ AEAD-Seal(key, nonce, plaintext, ad = header)
 - 认证记录的明文只有随机填充，它的作用是证明发送方算得出 `key`。记录体因此固定是 87 字节，
   与 Chrome 在 HTTP/2 连接开头发出的第一条记录（连接前言、SETTINGS 和 WINDOW_UPDATE）一样长（Chromium 157 实测）；紧随其后的份额记录则处在浏览器第一个请求的位置上。
 
-服务端在看到 ServerHello 之后，用 `S` 和 `E_pub` 算出 `shared`，对客户端发来的每一条 Application Data 记录尝试按认证记录的方式解密。
-解密成功且明文不超过 256 字节即认证通过。
+服务端在看到 ServerHello 之后，用 `S` 和 `E_pub` 算出 `shared`，对客户端随后发来的 Application Data 记录尝试按认证记录的方式解密。
+解密成功且明文不超过 256 字节即认证通过。服务端只尝试握手后的前 8 条记录，之后这条连接只做原样转发，所以认证记录必须紧跟在握手之后发出。
+出现 HelloRetryRequest 时，`E_pub` 取第一条 ClientHello 里的份额。
 认证通过后，服务端吞掉这条记录，停止转发并关闭到 `dest` 的连接；否则继续转发，中间设备甚至用户看到的始终是伪装站。
 随后服务端读取下一条记录，它必须是能解开的份额记录（明文不少于 1216 字节），否则关闭连接。份额记录须在 5 秒内到达。
+服务端收到 Application Data 后停止解析，并把后续字节原样转发；正常 EOF 会半关闭对应方向，以双向传递 FIN。
 
 因为密钥依赖每条连接都不同的 `server_random`，所以录下的认证记录无法在别的连接上重放。
 不知道 `S_pub` 的人算不出 `shared`，造不出认证记录；被动监听者也无从离线猜测，因为没有任何低熵的秘密。
@@ -214,8 +216,8 @@ Rust 实现以 `mio-rs` crate 暴露：
 版本常量：
 
 ```text
-二进制版本: 0.5.5
-协议版本:   0.5.3
+二进制版本: 0.5.6
+协议版本:   0.5.6
 ```
 
 协议版本参与 TCP auth label、QUIC marker key 和 QUIC auth key 派生。两端必须一致。

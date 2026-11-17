@@ -12,7 +12,7 @@ use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -22,10 +22,12 @@ use x25519_dalek::PublicKey;
 
 use crate::crypto::hkdf_key;
 
-const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.3";
+const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.6";
 
 const QUIC_V1_VERSION: u32 = 1;
 const MAX_PENDING_PACKETS: usize = 4;
+const MAX_UNKNOWN_FLOWS: usize = 1024;
+const RELAY_BUFFER_SIZE: usize = 2048;
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MIO_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -112,6 +114,7 @@ pub struct UdpDemuxSocket {
     marker_key: [u8; 32],
     destination: Option<SocketAddr>,
     flows: Arc<Mutex<HashMap<SocketAddr, Flow>>>,
+    unknown_flows: Arc<AtomicUsize>,
     replay: Arc<Mutex<ReplayCache>>,
 }
 
@@ -132,7 +135,21 @@ impl UdpDemuxSocket {
         destination: Option<SocketAddr>,
         stop: Arc<AtomicBool>,
     ) -> io::Result<Arc<Self>> {
-        let socket = Arc::new(UdpSocket::bind(address).await?);
+        let socket = socket2::Socket::new(
+            if address.is_ipv4() {
+                socket2::Domain::IPV4
+            } else {
+                socket2::Domain::IPV6
+            },
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_nonblocking(true)?;
+        socket.set_recv_buffer_size(7 << 20)?;
+        socket.set_send_buffer_size(7 << 20)?;
+        socket.bind(&address.into())?;
+        let socket = UdpSocket::from_std(socket.into())?;
+        let socket = Arc::new(socket);
         let marker_key =
             hkdf_key(server_public.as_bytes(), &[], QUIC_MARKER_INFO).map_err(io::Error::other)?;
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -143,6 +160,7 @@ impl UdpDemuxSocket {
             marker_key,
             destination,
             flows: Arc::new(Mutex::new(HashMap::new())),
+            unknown_flows: Arc::new(AtomicUsize::new(0)),
             replay: Arc::new(Mutex::new(ReplayCache::new())),
         });
 
@@ -184,12 +202,20 @@ impl UdpDemuxSocket {
 
         let action = {
             let mut flows = self.flows.lock().unwrap();
-            let flow = flows.entry(address).or_insert_with(|| Flow {
-                kind: FlowKind::Pending,
-                pending: Vec::new(),
-                relay: None,
-                cancel: None,
-                last: Instant::now(),
+            if !flows.contains_key(&address)
+                && self.unknown_flows.load(Ordering::Relaxed) >= MAX_UNKNOWN_FLOWS
+            {
+                return;
+            }
+            let flow = flows.entry(address).or_insert_with(|| {
+                self.unknown_flows.fetch_add(1, Ordering::Relaxed);
+                Flow {
+                    kind: FlowKind::Pending,
+                    pending: Vec::new(),
+                    relay: None,
+                    cancel: None,
+                    last: Instant::now(),
+                }
             });
             flow.last = Instant::now();
 
@@ -207,6 +233,7 @@ impl UdpDemuxSocket {
                             }) =>
                         {
                             flow.kind = FlowKind::Mio;
+                            self.unknown_flows.fetch_sub(1, Ordering::Relaxed);
                             let mut packets = std::mem::take(&mut flow.pending);
                             packets.push(packet);
                             Action::Mio(packets)
@@ -276,7 +303,7 @@ impl UdpDemuxSocket {
         let socket = self.socket.clone();
         let relay_reader = relay.clone();
         tokio::spawn(async move {
-            let mut buffer = vec![0_u8; 65_535];
+            let mut buffer = vec![0_u8; RELAY_BUFFER_SIZE];
             loop {
                 tokio::select! {
                     result = relay_reader.recv(&mut buffer) => {
@@ -323,10 +350,13 @@ impl UdpDemuxSocket {
                 })
                 .collect::<Vec<_>>();
             for address in expired {
-                if let Some(flow) = flows.remove(&address)
-                    && let Some(cancel) = flow.cancel
-                {
-                    cancel.notify_waiters();
+                if let Some(flow) = flows.remove(&address) {
+                    if flow.kind != FlowKind::Mio {
+                        self.unknown_flows.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    if let Some(cancel) = flow.cancel {
+                        cancel.notify_waiters();
+                    }
                 }
             }
         }

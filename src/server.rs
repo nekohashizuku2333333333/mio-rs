@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use crate::config::InboundConfig;
 use crate::crypto::{parse_private_key, read_share, server_exchange, transport_keys, verify_auth};
-use crate::protocol::{self, HANDSHAKE_SERVER_HELLO, RECORD_APPDATA, RECORD_HANDSHAKE};
+use crate::protocol::{
+    self, CopyOutcome, HANDSHAKE_SERVER_HELLO, RECORD_APPDATA, RECORD_HANDSHAKE, RecordAction,
+};
 use crate::quic;
 use crate::session::{Session, Stream};
 use crate::tls;
@@ -17,6 +19,8 @@ use x25519_dalek::StaticSecret;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SHARE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Client Application Data records inspected for authentication after the handshake.
+const MAX_AUTH_ATTEMPTS: usize = 8;
 
 #[derive(Default)]
 struct RelayState {
@@ -63,24 +67,6 @@ impl SharedState {
 
     fn is_authenticated(&self) -> bool {
         self.authenticated.load(Ordering::Acquire)
-    }
-
-    fn wait_server_random(&self, timeout: Duration) -> Option<[u8; 32]> {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.state.lock().unwrap();
-        while state.server_random.is_none() {
-            let now = Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            let remaining = deadline - now;
-            let (next, _) = self
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next;
-        }
-        state.server_random
     }
 
     fn mark_destination_done(&self) {
@@ -151,8 +137,13 @@ fn serve_connection(
 ) -> Result<()> {
     client.set_nodelay(true).ok();
     let remote = client.peer_addr()?;
-    let destination_address = format!("{}:{}", config.dest, config.dest_port);
-    let mut destination = connect_target(&config.dest, config.dest_port)
+    let dest_port = if config.dest_port == 0 {
+        config.listen_port
+    } else {
+        config.dest_port
+    };
+    let destination_address = format!("{}:{dest_port}", config.dest);
+    let mut destination = connect_target(&config.dest, dest_port)
         .with_context(|| format!("connect camouflage destination {destination_address}"))?;
 
     let state = Arc::new(SharedState::new());
@@ -174,12 +165,20 @@ fn serve_connection(
                     let mut random = [0_u8; 32];
                     random.copy_from_slice(&body[6..38]);
                     state_for_destination.set_server_random(random);
+                    RecordAction::Forward
+                } else if header[0] == RECORD_APPDATA {
+                    RecordAction::Passthrough
+                } else {
+                    RecordAction::Forward
                 }
-                false
             },
         );
         if !state_for_destination.is_authenticated() {
-            let _ = client_writer_for_destination.shutdown(std::net::Shutdown::Both);
+            if matches!(result, Ok(CopyOutcome::EndOfStream)) {
+                let _ = client_writer_for_destination.shutdown(std::net::Shutdown::Write);
+            } else {
+                let _ = client_writer_for_destination.shutdown(std::net::Shutdown::Both);
+            }
         }
         state_for_destination.mark_destination_done();
         result
@@ -187,9 +186,14 @@ fn serve_connection(
 
     let mut client_reader = client_reader;
     let state_for_client = state.clone();
-    let authenticated =
-        protocol::copy_records(&mut destination, &mut client_reader, |header, body| {
-            if header[0] == RECORD_HANDSHAKE {
+    let mut auth_attempts = 0;
+    let outcome = protocol::copy_records(&mut destination, &mut client_reader, |header, body| {
+        if header[0] == RECORD_HANDSHAKE {
+            let client_random = {
+                let state = state_for_client.state.lock().unwrap();
+                state.client_random
+            };
+            if client_random.is_none() {
                 let mut record = Vec::with_capacity(header.len() + body.len());
                 record.extend_from_slice(header);
                 record.extend_from_slice(body);
@@ -197,40 +201,53 @@ fn serve_connection(
                     state_for_client.set_client_hello(random, key_share);
                 }
             }
-            if header[0] != RECORD_APPDATA {
-                return false;
-            }
-            let Some(server_random) = state_for_client.wait_server_random(Duration::from_secs(2))
-            else {
-                return false;
-            };
-            let (client_random, client_key_share) = {
-                let state = state_for_client.state.lock().unwrap();
-                (state.client_random, state.client_key_share)
-            };
-            let (Some(client_random), Some(client_key_share)) = (client_random, client_key_share)
-            else {
-                return false;
-            };
-            if let Some(shared) = verify_auth(
-                server_private,
-                &client_key_share,
-                &client_random,
-                &server_random,
-                header,
-                body,
-            ) {
-                debug!("static-key authentication verified");
-                state_for_client.set_authenticated(shared);
-                return true;
-            }
-            debug!("application-data record is not mio authentication");
-            false
-        });
+            return RecordAction::Forward;
+        }
+        if header[0] != RECORD_APPDATA {
+            return RecordAction::Forward;
+        }
+        let (client_random, client_key_share, server_random) = {
+            let state = state_for_client.state.lock().unwrap();
+            (
+                state.client_random,
+                state.client_key_share,
+                state.server_random,
+            )
+        };
+        let (Some(client_random), Some(client_key_share), Some(server_random)) =
+            (client_random, client_key_share, server_random)
+        else {
+            return RecordAction::Passthrough;
+        };
+        if let Some(shared) = verify_auth(
+            server_private,
+            &client_key_share,
+            &client_random,
+            &server_random,
+            header,
+            body,
+        ) {
+            debug!("static-key authentication verified");
+            state_for_client.set_authenticated(shared);
+            return RecordAction::Claim;
+        }
+        auth_attempts += 1;
+        if auth_attempts >= MAX_AUTH_ATTEMPTS {
+            debug!("authentication attempt limit reached; passing through");
+            return RecordAction::Passthrough;
+        }
+        debug!("application-data record is not mio authentication");
+        RecordAction::Forward
+    });
 
-    if !authenticated.unwrap_or(false) {
-        let _ = destination.shutdown(std::net::Shutdown::Both);
-        let _ = destination_task.join();
+    if !matches!(outcome, Ok(CopyOutcome::Claimed)) {
+        if matches!(outcome, Ok(CopyOutcome::EndOfStream)) {
+            let _ = destination.shutdown(std::net::Shutdown::Write);
+            let _ = destination_task.join();
+        } else {
+            let _ = destination.shutdown(std::net::Shutdown::Both);
+            let _ = destination_task.join();
+        }
         return Ok(());
     }
     let _ = destination.shutdown(std::net::Shutdown::Both);

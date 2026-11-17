@@ -1,4 +1,4 @@
-# Chrome 133 ClientHello 复现报告
+# Chrome 156+ ClientHello 复现报告
 
 ## 上游基准
 
@@ -9,8 +9,10 @@ github.com/refraction-networking/utls v1.8.2
 utls.HelloChrome_Auto
 ```
 
-在 uTLS v1.8.2 中 `HelloChrome_Auto == HelloChrome_133`。每条 TCP 连接新建
-`UClient`，没有 session cache，因此观察对象是无 PSK、无恢复的首次 ClientHello。
+上游使用 uTLS v1.8.2；其中 `HelloChrome_Auto == HelloChrome_133`。v0.5.6 在该
+spec 的 `signature_algorithms` 前插入一个随机 GREASE 值和 ML-DSA-44/65/87，并在
+每条 TCP 连接新建 `UClient`，没有 session cache，因此观察对象是无 PSK、无恢复的
+首次 ClientHello。
 
 ## Rust 配置
 
@@ -64,8 +66,8 @@ Brotli certificate compression 必须注册真实的 decompressor，否则 Borin
 30 次 uTLS 与 30 次 Rust BoringSSL 对比：
 
 ```text
-JA4                 t13d1516h2_8daaf6152771_d8a2da3f94cd   30/30
-canonical JA3 MD5   8e19337e7524d2573be54efb2b0784c9      30/30
+JA4                 t13d1516h2_8daaf6152771_806a8c22fdea   capture-matched
+canonical JA3 MD5   8e19337e7524d2573be54efb2b0784c9       capture-matched
 ```
 
 canonical JA3 明文字段：
@@ -87,7 +89,7 @@ canonical JA3 明文字段：
 | session ID | 32 字节随机，非空 |
 | 非 GREASE ciphers | `1301 1302 1303 c02b c02f c02c c030 cca9 cca8 c013 c014 009c 009d 002f 0035` |
 | groups | `11ec 001d 0017 0018` |
-| sigalgs | `0403 0804 0401 0503 0805 0501 0806 0601` |
+| sigalgs | `GREASE 0904 0905 0906 0403 0804 0401 0503 0805 0501 0806 0601` |
 | supported_versions | `0304 0303` |
 | ALPN | `h2`, `http/1.1` |
 | ALPS | 新 codepoint `0x44cd`，body `0003026832` |
@@ -105,9 +107,9 @@ Chrome 106+ 与 uTLS `ShuffleChromeTLSExtensions` 会随机打乱 16 个非 GREA
 
 ## BoringSSL 补丁与 vendored 构建
 
-stock BoringSSL 会在 `signature_algorithms` 中多放一个 GREASE 值，并且不会暴露
-TLS ClientHello 的 X25519 key_share 私钥。mio v0.5.3 的静态认证同时需要这两项，
-因此仓库内置 `vendor/boringssl` 并在其上应用三个补丁：
+stock BoringSSL 的默认 sigalg 列表不含 Chrome 156+ 的 GREASE + ML-DSA 前缀，也
+不会暴露 TLS ClientHello 的 X25519 key_share 私钥。mio v0.5.6 的静态认证需要后者，
+指纹需要前者，因此仓库内置 `vendor/boringssl` 并在其上应用三个补丁：
 
 1. `boring-pq.patch`（boring-sys 的 Cloudflare PQ 补丁）
 2. `patches/boringssl-no-sigalg-grease.patch`
@@ -120,9 +122,9 @@ TLS ClientHello 的 X25519 key_share 私钥。mio v0.5.3 的静态认证同时�
 实测在 ECH GREASE body 为 282 字节时：
 
 ```text
-stock boring      1819 bytes
-patched           1817 bytes
-uTLS Chrome 133   1817 bytes
+stock boring      1821 bytes
+patched           1821 bytes
+uTLS v0.5.6 spec  1825 bytes
 ```
 
 X25519 补丁通过真实 TLS 1.3 握手、HelloRetryRequest、`SSL_CONFIG` shedding 和
@@ -138,6 +140,8 @@ hybrid-only 的 ClientHello 返回 0。
 ./target/release/mio fingerprint --server 127.0.0.1:19443 --dest example.com
 ```
 
-输出中的 `chrome_133_match=true` 要求 JA4 和 canonical JA3 MD5 同时匹配。离线样本
-测试位于 `tests/fingerprint.rs`；`vendor/boringssl` 的 X25519 补丁探针位于
+输出中的 `chrome_156_match=true` 要求 JA4 和 canonical JA3 MD5 同时匹配。离线样本
+测试位于 `tests/fingerprint.rs`；真实 Chrome 156/158 还会发送上游未实现的
+`trust_anchors (0xca34)`，因此浏览器捕获的 JA4 是 `..._cb7bf5808d99`，而本实现与
+上游 v0.5.6 对齐为 `..._806a8c22fdea`。`vendor/boringssl` 的 X25519 补丁探针位于
 `.research/v051-bssl/probe/x25519_probe.cc` 和 `test-output.txt`，其测试覆盖 HRR 和配置 shedding。

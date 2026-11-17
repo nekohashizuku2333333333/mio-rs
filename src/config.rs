@@ -51,7 +51,7 @@ pub struct OutboundConfig {
     pub server_port: u16,
     #[serde(default)]
     pub dest: String,
-    #[serde(default = "default_port")]
+    #[serde(default)]
     pub dest_port: u16,
     #[serde(default)]
     pub public_key: String,
@@ -69,7 +69,7 @@ pub struct InboundConfig {
     pub listen_port: u16,
     #[serde(default)]
     pub dest: String,
-    #[serde(default = "default_port")]
+    #[serde(default)]
     pub dest_port: u16,
     #[serde(default)]
     pub private_key: String,
@@ -129,9 +129,7 @@ impl Config {
         if inbound.dest.trim().is_empty() {
             bail!("configuration must set [inbounds].dest");
         }
-        if inbound.dest_port == 0 {
-            bail!("[inbounds].dest_port must be between 1 and 65535");
-        }
+        // Zero (omitted or explicit) means "use listen_port"; see server::run.
         if inbound.private_key.is_empty() {
             bail!("configuration must set [inbounds].private_key (run `mio keygen`)");
         }
@@ -156,9 +154,8 @@ impl Config {
         if outbound.dest.trim().is_empty() {
             bail!("configuration must set [outbounds].dest");
         }
-        if outbound.dest_port == 0 {
-            bail!("[outbounds].dest_port must be between 1 and 65535");
-        }
+        // `dest_port` is optional for clients and is not used by the client
+        // protocol; accept its zero default for configuration parity.
         if outbound.public_key.is_empty() {
             bail!("configuration must set [outbounds].public_key (run `mio keygen`)");
         }
@@ -229,5 +226,28 @@ mod tests {
         .unwrap();
         assert!(!config.is_server());
         assert_eq!(config.outbounds.server_port, 443);
+        assert_eq!(config.outbounds.dest_port, 0);
+    }
+
+    #[test]
+    fn omitted_dest_port_uses_listen_port_for_server() {
+        let config: Config = toml::from_str(
+            r#"
+            [inbounds]
+            listen = "127.0.0.1"
+            listen_port = 8443
+            dest = "www.example.com"
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.inbounds.dest_port, 0);
+        let effective = if config.inbounds.dest_port == 0 {
+            config.inbounds.listen_port
+        } else {
+            config.inbounds.dest_port
+        };
+        assert_eq!(effective, 8443);
     }
 }
