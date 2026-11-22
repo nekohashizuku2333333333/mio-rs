@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Handle, Runtime};
 
 use crate::config::{InboundConfig, OutboundConfig};
@@ -24,8 +24,8 @@ use crate::udp_demux::UdpDemuxSocket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const QUIC_EXPORTER_LABEL: &[u8] = b"mio quic auth";
-const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.5.7";
-const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.7";
+const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.6.0";
+const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.6.0";
 const QUIC_CLIENT_LABEL: &[u8] = b"client";
 const QUIC_SERVER_LABEL: &[u8] = b"server";
 const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -291,6 +291,8 @@ impl QuicSession {
     }
 
     pub fn dial_stream(&self, target: &str) -> Result<QuicStream> {
+        let mut request = Vec::new();
+        protocol::write_request(&mut request, target)?;
         let (mut send, mut recv) = self
             .runtime
             .block_on(async {
@@ -298,23 +300,43 @@ impl QuicSession {
             })
             .map_err(|_| anyhow!("open QUIC stream timed out"))?
             .context("open QUIC stream")?;
-        let mut request = Vec::new();
-        protocol::write_request(&mut request, target)?;
-        self.runtime
-            .block_on(async { send.write_all(&request).await })
-            .context("write target request over QUIC")?;
+        let deadline = Instant::now() + QUIC_REPLY_TIMEOUT;
         let mut reply = [0_u8; 1];
-        self.runtime
-            .block_on(async {
-                tokio::time::timeout(QUIC_REPLY_TIMEOUT, recv.read_exact(&mut reply)).await
-            })
-            .map_err(|_| anyhow!("QUIC target reply timed out"))?
-            .context("read target reply over QUIC")?;
+        let result = self.runtime.block_on(async {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("QUIC target request timed out");
+            }
+            tokio::time::timeout(remaining, send.write_all(&request))
+                .await
+                .map_err(|_| anyhow!("QUIC target request timed out"))?
+                .context("write target request over QUIC")?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("QUIC target reply timed out");
+            }
+            tokio::time::timeout(remaining, recv.read_exact(&mut reply))
+                .await
+                .map_err(|_| anyhow!("QUIC target reply timed out"))?
+                .context("read target reply over QUIC")?;
+            Ok::<_, anyhow::Error>(())
+        });
+        if let Err(error) = result {
+            let _ = send.reset(0u32.into());
+            let _ = recv.stop(0u32.into());
+            return Err(error);
+        }
         if reply[0] != protocol::REPLY_OK {
+            let _ = send.reset(0u32.into());
+            let _ = recv.stop(0u32.into());
             return Err(TargetConnectFailed.into());
         }
         let handle = self.runtime.handle().clone();
         Ok(QuicStream::new(handle, send, recv))
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
     }
 
     pub fn close(&self) {

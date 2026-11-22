@@ -216,8 +216,8 @@ Rust 实现以 `mio-rs` crate 暴露：
 版本常量：
 
 ```text
-二进制版本: 0.5.8
-协议版本:   0.5.7
+二进制版本: 0.6.0
+协议版本:   0.6.0
 ```
 
 协议版本参与 TCP auth label、QUIC marker key 和 QUIC auth key 派生。两端必须一致。

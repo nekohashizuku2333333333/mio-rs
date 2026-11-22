@@ -19,6 +19,66 @@ pub const FRAME_HEADER_SIZE: usize = 7;
 pub const MAX_FRAME_PAYLOAD: usize = 16384 + 1 + 16 - AEAD_OVERHEAD - FRAME_HEADER_SIZE;
 pub const STREAM_WINDOW: usize = 16 << 20;
 const ACCEPT_BACKLOG: usize = 256;
+const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct WriteGate {
+    busy: Mutex<bool>,
+    ready: Condvar,
+    closed: AtomicBool,
+}
+
+struct WriteGateGuard<'a>(&'a WriteGate);
+
+impl Drop for WriteGateGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.busy.lock().unwrap() = false;
+        self.0.ready.notify_one();
+    }
+}
+
+impl WriteGate {
+    fn acquire(&self, deadline: Option<Instant>) -> io::Result<WriteGateGuard<'_>> {
+        let mut busy = self.busy.lock().unwrap();
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
+            }
+            if !*busy {
+                *busy = true;
+                return Ok(WriteGateGuard(self));
+            }
+            if let Some(deadline) = deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "stream write timeout",
+                    ));
+                }
+                let (next, _) = self
+                    .ready
+                    .wait_timeout(busy, deadline.saturating_duration_since(now))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                busy = next;
+            } else {
+                busy = self
+                    .ready
+                    .wait(busy)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+    }
+
+    fn notify_deadline_change(&self) {
+        self.ready.notify_all();
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.ready.notify_all();
+    }
+}
 
 pub struct Session {
     inner: Arc<SessionInner>,
@@ -42,7 +102,7 @@ struct SessionInner {
     accept_rx: Mutex<mpsc::Receiver<Arc<StreamState>>>,
     started: AtomicBool,
     last_recv: AtomicI64,
-    open_mu: Mutex<()>,
+    write_gate: WriteGate,
     client: bool,
 }
 
@@ -69,6 +129,7 @@ struct SessionState {
 struct StreamState {
     state: Mutex<StreamData>,
     ready: Condvar,
+    write_lock: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -137,7 +198,7 @@ impl Session {
             accept_rx: Mutex::new(accept_rx),
             started: AtomicBool::new(false),
             last_recv: AtomicI64::new(0),
-            open_mu: Mutex::new(()),
+            write_gate: WriteGate::default(),
             client,
         });
         Self { inner }
@@ -158,7 +219,8 @@ impl Session {
     pub fn write_ready(&self, payload: &[u8]) -> Result<()> {
         let limit = MAX_FRAME_PAYLOAD.saturating_sub(payload.len());
         let padding = random_range(0, limit.min(1024));
-        self.inner.write_frame(FRAME_READY, 0, payload, padding)
+        self.inner
+            .write_frame(FRAME_READY, 0, payload, padding, None)
     }
 
     pub fn wait_ready(&self) -> Result<Vec<u8>> {
@@ -198,6 +260,7 @@ impl Session {
                     ..StreamData::default()
                 }),
                 ready: Condvar::new(),
+                write_lock: Mutex::new(()),
             }),
         };
         Ok(stream)
@@ -308,7 +371,29 @@ impl SessionInner {
         }
     }
 
-    fn write_frame(&self, kind: u8, stream_id: u32, payload: &[u8], padding: usize) -> Result<()> {
+    fn write_frame(
+        &self,
+        kind: u8,
+        stream_id: u32,
+        payload: &[u8],
+        padding: usize,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let _writer = self.write_gate.acquire(deadline)?;
+        self.write_frame_locked(kind, stream_id, payload, padding, deadline)
+    }
+
+    fn write_frame_locked(
+        &self,
+        kind: u8,
+        stream_id: u32,
+        payload: &[u8],
+        padding: usize,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        if self.session_state.lock().unwrap().error.is_some() {
+            bail!("session closed");
+        }
         if payload.len() > MAX_FRAME_PAYLOAD {
             bail!("frame payload too large");
         }
@@ -319,6 +404,17 @@ impl SessionInner {
         plain.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         plain.extend_from_slice(payload);
         plain.extend_from_slice(&random_bytes(padding));
+
+        let timeout = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(SESSION_WRITE_TIMEOUT)
+            .min(SESSION_WRITE_TIMEOUT);
+        if timeout.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "stream write timeout").into());
+        }
+        self.conn
+            .set_write_timeout(Some(timeout))
+            .map_err(anyhow::Error::from)?;
 
         let mut send = self.send.lock().unwrap();
         let body_length = plain.len() + AEAD_OVERHEAD;
@@ -339,7 +435,12 @@ impl SessionInner {
         let mut record = Vec::with_capacity(RECORD_HEADER_SIZE + body.len());
         record.extend_from_slice(&header);
         record.extend_from_slice(&body);
-        (&self.conn).write_all(&record)?;
+        let result = (&self.conn).write_all(&record);
+        drop(send);
+        if let Err(error) = result {
+            self.close_with_error(&error.to_string());
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -357,6 +458,7 @@ impl SessionInner {
             data.closed = true;
             stream.ready.notify_all();
         }
+        self.write_gate.close();
         let _ = self.conn.shutdown(Shutdown::Both);
     }
 
@@ -389,6 +491,7 @@ impl SessionInner {
                 ..StreamData::default()
             }),
             ready: Condvar::new(),
+            write_lock: Mutex::new(()),
         });
         state.streams.insert(stream_id, stream_state.clone());
         match self.accept_tx.try_send(stream_state.clone()) {
@@ -416,11 +519,17 @@ impl Stream {
         self.stream.state.lock().unwrap().read_deadline = timeout.map(|d| Instant::now() + d);
     }
 
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) {
+        self.stream.state.lock().unwrap().write_deadline = timeout.map(|d| Instant::now() + d);
+        self.session.write_gate.notify_deadline_change();
+    }
+
     pub fn shutdown_session(&self) {
         self.session.close_with_error("session closed");
     }
 
     pub fn close(&self) -> Result<()> {
+        let _write = self.stream.write_lock.lock().unwrap();
         let mut data = self.stream.state.lock().unwrap();
         if data.closed {
             return Ok(());
@@ -435,15 +544,16 @@ impl Stream {
         self.stream.ready.notify_all();
         self.session.remove_stream(id);
         if send_close {
-            self.session.write_frame(FRAME_CLOSE, id, &[], 0)?;
+            self.session.write_frame(FRAME_CLOSE, id, &[], 0, None)?;
         }
         if send_reset {
-            self.session.write_frame(FRAME_RESET, id, &[], 0)?;
+            self.session.write_frame(FRAME_RESET, id, &[], 0, None)?;
         }
         Ok(())
     }
 
     pub fn close_write(&self) -> Result<()> {
+        let _write = self.stream.write_lock.lock().unwrap();
         let mut data = self.stream.state.lock().unwrap();
         if data.send_closed || data.closed {
             return Ok(());
@@ -453,28 +563,29 @@ impl Stream {
         let reset = data.reset;
         drop(data);
         if id != 0 && !reset {
-            self.session.write_frame(FRAME_CLOSE, id, &[], 0)?;
+            self.session.write_frame(FRAME_CLOSE, id, &[], 0, None)?;
         }
         Ok(())
     }
 
-    fn write_data(&self, payload: &[u8], padding: usize) -> Result<()> {
-        let mut data = self.stream.state.lock().unwrap();
-        let mut id = data.id;
-        if id == 0 {
-            let _open_guard = self.session.open_mu.lock().unwrap();
-            let mut state = self.session.session_state.lock().unwrap();
-            if state.error.is_some() {
-                bail!("session closed");
+    fn write_data(&self, payload: &[u8], padding: usize, deadline: Option<Instant>) -> Result<()> {
+        let _writer = self.session.write_gate.acquire(deadline)?;
+        let id = {
+            let mut data = self.stream.state.lock().unwrap();
+            if data.id == 0 {
+                let mut state = self.session.session_state.lock().unwrap();
+                if state.error.is_some() {
+                    bail!("session closed");
+                }
+                data.id = state.next_id;
+                state.next_id += 1;
+                state.unopened = state.unopened.saturating_sub(1);
+                state.streams.insert(data.id, self.stream.clone());
             }
-            id = state.next_id;
-            state.next_id += 1;
-            state.unopened = state.unopened.saturating_sub(1);
-            state.streams.insert(id, self.stream.clone());
-            data.id = id;
-        }
-        drop(data);
-        self.session.write_frame(FRAME_DATA, id, payload, padding)
+            data.id
+        };
+        self.session
+            .write_frame_locked(FRAME_DATA, id, payload, padding, deadline)
     }
 }
 
@@ -507,6 +618,7 @@ impl Read for Stream {
                         id,
                         &(increment as u32).to_be_bytes(),
                         0,
+                        None,
                     );
                 }
                 return Ok(n);
@@ -543,9 +655,10 @@ impl Read for Stream {
 
 impl Write for Stream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let _write = self.stream.write_lock.lock().unwrap();
         let mut total = 0;
         while total < buffer.len() {
-            let (n, data_frames, next_padding) = {
+            let (n, data_frames, next_padding, deadline) = {
                 let mut data = self.stream.state.lock().unwrap();
                 if data.closed || data.send_closed {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stream closed"));
@@ -556,36 +669,43 @@ impl Write for Stream {
                         "stream reset",
                     ));
                 }
+                let deadline = data.write_deadline;
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "stream write timeout",
+                    ));
+                }
                 let n = (buffer.len() - total)
                     .min(data.send_credit)
                     .min(MAX_FRAME_PAYLOAD);
                 if n == 0 {
-                    let deadline = data.write_deadline;
                     data = self
                         .stream
                         .ready
                         .wait_timeout(data, Duration::from_millis(100))
                         .unwrap()
                         .0;
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "stream write timeout",
-                        ));
-                    }
                     continue;
                 }
                 data.send_credit -= n;
                 let data_frames = data.sent_data;
                 data.sent_data += 1;
                 let next = data.next_padding.take();
-                (n, data_frames, next)
+                (n, data_frames, next, deadline)
             };
             let padding = next_padding
                 .map(|(minimum, maximum)| random_range(minimum, maximum))
                 .unwrap_or_else(|| default_padding(data_frames, n));
-            self.write_data(&buffer[total..total + n], padding)
-                .map_err(io::Error::other)?;
+            if let Err(error) = self.write_data(&buffer[total..total + n], padding, deadline) {
+                let mut data = self.stream.state.lock().unwrap();
+                data.send_credit += n;
+                data.sent_data = data.sent_data.saturating_sub(1);
+                if data.next_padding.is_none() {
+                    data.next_padding = next_padding;
+                }
+                return Err(write_io_error(error));
+            }
             total += n;
         }
         Ok(total)
@@ -594,6 +714,14 @@ impl Write for Stream {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+fn write_io_error(error: anyhow::Error) -> io::Error {
+    let kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>().map(io::Error::kind))
+        .unwrap_or(io::ErrorKind::Other);
+    io::Error::new(kind, format!("{error:#}"))
 }
 
 fn monotonic_nanos() -> i64 {
@@ -718,8 +846,68 @@ impl SessionInner {
 mod tests {
     use super::*;
 
+    fn test_session() -> Session {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let connector = std::thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
+        let (server, _) = listener.accept().unwrap();
+        let _peer = connector.join().unwrap();
+        let reader = BufReader::new(server.try_clone().unwrap());
+        Session::new(
+            server,
+            reader,
+            AeadKey::new(&[7_u8; 32]),
+            AeadKey::new(&[9_u8; 32]),
+            true,
+        )
+    }
+
     #[test]
     fn stream_window_is_16_mib() {
         assert_eq!(STREAM_WINDOW, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn blocked_stream_write_observes_deadline_and_rolls_back() {
+        let session = test_session();
+        let mut stream = session.open().unwrap();
+        stream.set_next_padding(1024, 1024);
+        stream.set_write_timeout(Some(Duration::from_millis(50)));
+        let state = stream.stream.clone();
+        let gate = session.inner.write_gate.acquire(None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(stream.write(b"deadline-test")).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let data = state.state.lock().unwrap();
+        assert_eq!(data.send_credit, STREAM_WINDOW);
+        assert_eq!(data.sent_data, 0);
+        assert_eq!(data.next_padding, Some((1024, 1024)));
+        drop(data);
+        drop(gate);
+    }
+
+    #[test]
+    fn session_close_wakes_blocked_writer_and_rolls_back() {
+        let session = test_session();
+        let mut stream = session.open().unwrap();
+        stream.set_next_padding(512, 512);
+        let state = stream.stream.clone();
+        let gate = session.inner.write_gate.acquire(None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(stream.write(b"close-test")).unwrap();
+        });
+        session.close();
+        let result = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_err());
+        let data = state.state.lock().unwrap();
+        assert_eq!(data.send_credit, STREAM_WINDOW);
+        assert_eq!(data.sent_data, 0);
+        assert_eq!(data.next_padding, Some((512, 512)));
+        drop(data);
+        drop(gate);
     }
 }
