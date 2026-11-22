@@ -24,8 +24,8 @@ use crate::udp_demux::UdpDemuxSocket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const QUIC_EXPORTER_LABEL: &[u8] = b"mio quic auth";
-const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.5.6";
-const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.6";
+const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.5.7";
+const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.7";
 const QUIC_CLIENT_LABEL: &[u8] = b"client";
 const QUIC_SERVER_LABEL: &[u8] = b"server";
 const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -207,6 +207,12 @@ pub struct QuicSession {
     connection: Connection,
     endpoint: Endpoint,
     runtime: Arc<Runtime>,
+}
+
+impl Drop for QuicSession {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 impl QuicSession {
@@ -453,10 +459,15 @@ pub fn run_server(config: InboundConfig, stop: Arc<AtomicBool>) -> Result<()> {
         } else {
             config.dest_port
         };
-        let destination = resolve_udp(&config.dest, dest_port).ok();
-        let socket = UdpDemuxSocket::bind(address, public_key, destination, stop.clone())
-            .await
-            .context("bind UDP demux socket")?;
+        let socket = UdpDemuxSocket::bind(
+            address,
+            public_key,
+            config.dest.clone(),
+            dest_port,
+            stop.clone(),
+        )
+        .await
+        .context("bind UDP demux socket")?;
         let quinn_runtime =
             quinn::default_runtime().ok_or_else(|| anyhow!("no Quinn async runtime available"))?;
         let endpoint = Endpoint::new_with_abstract_socket(

@@ -174,7 +174,7 @@ Deploy Key 只作用于这一个仓库，比账号级 PAT 更适合自动化。
 每日同步任务（本机）
   └─ 检测上游变化 → 移植 → 验证
        ├─ git push（Deploy Key，仅代码/tag）
-       └─ git push tag v0.5.6
+       └─ git push tag v<version>
               └─ GitHub Actions: release.yml
                    ├─ 构建多平台二进制
                    ├─ GITHUB_TOKEN 创建 GitHub Release + 上传附件

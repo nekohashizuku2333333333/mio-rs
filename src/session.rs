@@ -17,7 +17,7 @@ pub const FRAME_RESET: u8 = 3;
 pub const FRAME_WINDOW: u8 = 4;
 pub const FRAME_HEADER_SIZE: usize = 7;
 pub const MAX_FRAME_PAYLOAD: usize = 16384 + 1 + 16 - AEAD_OVERHEAD - FRAME_HEADER_SIZE;
-pub const STREAM_WINDOW: usize = 4 << 20;
+pub const STREAM_WINDOW: usize = 16 << 20;
 const ACCEPT_BACKLOG: usize = 256;
 
 pub struct Session {
@@ -248,6 +248,10 @@ impl Session {
 
     pub fn close(&self) {
         self.inner.close_with_error("session closed");
+    }
+
+    pub fn same_session(&self, other: &Session) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -707,5 +711,15 @@ impl SessionInner {
                 plain[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_length].to_vec(),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_window_is_16_mib() {
+        assert_eq!(STREAM_WINDOW, 16 * 1024 * 1024);
     }
 }

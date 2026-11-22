@@ -1,6 +1,6 @@
-# v0.5.6 差异补全与可行性研究
+# v0.5.8 差异补全与可行性研究
 
-本文记录 Rust 重写与上游 `orgmio/mio` v0.5.6（线上协议 v0.5.6）的逐项差异。
+本文记录 Rust 重写与上游 `orgmio/mio` v0.5.8（线上协议 v0.5.7）的逐项差异。
 
 ## 总览
 
@@ -18,7 +18,7 @@
 
 ## TCP 静态认证
 
-v0.5.6 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
+v0.5.8 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
 
 ```text
 shared = X25519(client TLS key_share private, server static public)
@@ -28,7 +28,7 @@ shared = X25519(client TLS key_share private, server static public)
 握手后客户端连续发送两条记录：
 
 ```text
-key       = HKDF(shared, client_random ‖ server_random, "mio auth 0.5.6")
+key       = HKDF(shared, client_random ‖ server_random, "mio auth 0.5.7")
 认证记录: nonce = 0，plaintext = random_padding(71)
 份额记录: nonce = 1，plaintext = client_share(1216) ‖ random_padding(0–255)
 header    = 17 03 03 ‖ length
@@ -38,22 +38,25 @@ record    = header ‖ AEAD-Seal(key, nonce, plaintext, ad=header)
 服务端先验证认证记录，再读取份额记录。认证记录固定 87 字节密文，对应 Chromium
 HTTP/2 连接开头的第一条 Application Data 记录。
 
+TLS 记录转发只在对端正常 EOF 时转发已读到的残缺记录；本地主动关闭或发生 I/O
+错误时丢弃残缺部分，避免给对端留下半条记录导致后续记录错位。
+
 BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringssl` 增加了
 稳定 getter，并经过真实 TLS 1.3 握手、HelloRetryRequest、配置 shedding 和公私钥
 一致性测试。
 
 ## TCP 多路复用
 
-`src/session.rs` 实现 v0.5.6 `Session`：
+`src/session.rs` 实现 v0.5.8 `Session`：
 
 - 帧头：`type(1) ‖ stream_id(4) ‖ payload_length(2)`
 - ready/data/close/reset/window 五种帧
-- 每条流每方向初始接收窗口 4 MiB
+- 每条流每方向初始接收窗口 16 MiB
 - 流编号由客户端分配，从 1 递增；服务端收到新编号的第一个 data 帧即创建流
 - 客户端 pool 尽量复用同一条 TCP session，达到 100 条流后再新建
 - 每条流的读写独立阻塞，不阻塞同一 session 的其他流
 
-本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.5.6 客户端到 Rust 服务端
+本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.5.8 客户端到 Rust 服务端
 也通过了同一条 TCP 连接上的两条流。
 
 ## 服务端 QUIC UDP 分流
@@ -64,7 +67,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 2. 对每个 UDP 源地址维护 `Pending / Mio / Relay` 流状态。
 3. 解密 QUIC v1 Initial 并读取 ClientHello.random。
 4. marker key 由服务端静态公钥经
-   `HKDF(public_key, empty_salt, "mio quic marker 0.5.6")` 派生。
+   `HKDF(public_key, empty_salt, "mio quic marker 0.5.7")` 派生。
 5. 验证 16 字节 nonce + 16 字节分钟级 HMAC，接受当前分钟 ±1 分钟。
 6. 用 replay cache 拒绝重复 marker。
 7. 无 marker 的流按客户端地址建立到 `dest` 的 UDP relay，响应从同一服务端
@@ -80,6 +83,10 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 - 随机 10–30 分钟后重新探测。
 - QUIC stream 传输失败时回退 TCP。
 - TCP 请求 reply 超时且整个会话期间没有收到任何记录时，关闭该僵死 session。
+- TCP pool 的并发建连共享同一个 attempt；失败结果由所有等待者共享，不会逐个重试。
+- TCP 建连、TLS 握手、认证记录和 ready 使用 10 秒总预算（DNS 解析仍受系统解析器限制）。
+- probe 只有首个成功结果会更新状态；另一线程的结果直接丢弃，不执行延后状态更新，
+  因此不需要 Go 的 revision 机制。被丢弃的拥有型 QUIC session 由 `Drop` 关闭。
 - TCP 使用 session pool，多个代理连接复用同一条 TCP 连接。
 
 验证：占用服务端 UDP 端口强制 QUIC bind 失败后，SOCKS5 echo 仍成功并选择 TCP。
@@ -96,7 +103,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 
 - JA4 `t13d1516h2_8daaf6152771_806a8c22fdea`
 - canonical JA3 MD5 `8e19337e7524d2573be54efb2b0784c9`
-- raw ClientHello 与 uTLS 的固定长度一致（ECH body 282 时为 1817 bytes）
+- raw ClientHello 与 uTLS 的固定长度一致（ECH body 282 时为 1825 bytes）
 
 扩展顺序仍然随机，逐连接 JA3 MD5 不稳定是 Chrome 本身行为。上游在 uTLS Chrome 133
 扩展集上给 `signature_algorithms` 前置 GREASE + ML-DSA-44/65/87；Rust 的 vendored
@@ -124,3 +131,13 @@ sampler。因此口径是“已启用 Quinn 实验性 BBR”，不是“算法�
 - Quinn BBR 不是上游算法逐行等价实现。
 - 不提供 UDP-over-SOCKS5。
 - QUIC 未复刻上游的零长度源 Connection ID。
+- 未复刻 Go 的 recvmmsg / OOB / GSO 优化；Rust 继续使用 Quinn 自身的分段发送和
+  `AsyncUdpSocket` 路径。收包 Vec 在循环外复用，relay 缓冲保持 2048 字节。
+- Go 的 `DialTCP`、可替换 `PaddingPolicy` 和公开 `NewSession` 属于上游 API 调整，
+  Rust 已有自己的 API/内部填充实现，不做机械复制。
+- Go 的 Session 发送/接收缓冲和 nonce 原地复用、加密缓冲 zero padding 属于内部性能优化；
+  Rust 的 Session 结构不同，暂未逐项照搬，线上帧长度语义保持一致。
+- Rust TCP session pool 没有复刻 Go 客户端 4–6 分钟空闲回收；当前按 100 条流上限或
+  session 关闭来换新连接。
+- Go 每次探测会在后台应用完整延迟样本和 revision；Rust 首个成功结果立即生效，
+  另一结果丢弃且不写回状态，因此没有旧结果覆盖新选择的路径，但也没有后台样本合并。

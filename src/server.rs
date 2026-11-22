@@ -151,10 +151,12 @@ fn serve_connection(
     let mut client_writer_for_destination = client.try_clone()?;
     let client_reader = BufReader::new(client.try_clone()?);
 
+    let destination_closed = Arc::new(AtomicBool::new(false));
+    let destination_closed_for_task = destination_closed.clone();
     let state_for_destination = state.clone();
     let destination_task = std::thread::spawn(move || {
         let mut reader = BufReader::new(destination_reader);
-        let result = protocol::copy_records(
+        let result = protocol::copy_records_cancellable(
             &mut client_writer_for_destination,
             &mut reader,
             |header, body| {
@@ -172,6 +174,7 @@ fn serve_connection(
                     RecordAction::Forward
                 }
             },
+            Some(&destination_closed_for_task),
         );
         if !state_for_destination.is_authenticated() {
             if matches!(result, Ok(CopyOutcome::EndOfStream)) {
@@ -245,11 +248,13 @@ fn serve_connection(
             let _ = destination.shutdown(std::net::Shutdown::Write);
             let _ = destination_task.join();
         } else {
+            destination_closed.store(true, Ordering::Release);
             let _ = destination.shutdown(std::net::Shutdown::Both);
             let _ = destination_task.join();
         }
         return Ok(());
     }
+    destination_closed.store(true, Ordering::Release);
     let _ = destination.shutdown(std::net::Shutdown::Both);
     state.wait_destination_done(Duration::from_secs(2));
     let _ = destination_task.join();

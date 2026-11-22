@@ -4,7 +4,7 @@ use rand::Rng;
 use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::OutboundConfig;
@@ -15,7 +15,7 @@ use crate::session::{Session, Stream};
 use crate::tls;
 use x25519_dalek::StaticSecret;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -51,8 +51,64 @@ struct DialerState {
 
 struct Dialer {
     peer: OutboundConfig,
-    tcp_session: Mutex<Option<Session>>,
+    tcp_pool: Mutex<TcpPoolState>,
     state: Mutex<DialerState>,
+}
+
+#[derive(Default)]
+struct TcpPoolState {
+    session: Option<Session>,
+    attempt: Option<Arc<TcpDialAttempt>>,
+}
+
+struct TcpDialAttempt {
+    result: Mutex<Option<Result<(), Arc<anyhow::Error>>>>,
+    ready: Condvar,
+}
+
+enum TcpPoolClaim {
+    Ready(Session),
+    Wait(Arc<TcpDialAttempt>),
+    Lead,
+}
+
+fn claim_tcp_pool(pool: &mut TcpPoolState) -> TcpPoolClaim {
+    if let Some(session) = pool.session.as_ref()
+        && !session.is_closed()
+        && session.num_streams() < 100
+    {
+        return TcpPoolClaim::Ready(session.clone());
+    }
+    if let Some(attempt) = pool.attempt.as_ref() {
+        return TcpPoolClaim::Wait(attempt.clone());
+    }
+    pool.attempt = Some(Arc::new(TcpDialAttempt::new()));
+    TcpPoolClaim::Lead
+}
+
+impl TcpDialAttempt {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn finish(&self, result: Result<(), Arc<anyhow::Error>>) {
+        *self.result.lock().unwrap() = Some(result);
+        self.ready.notify_all();
+    }
+
+    fn wait(&self) -> Result<(), Arc<anyhow::Error>> {
+        let mut result = self.result.lock().unwrap();
+        while result.is_none() {
+            result = self.ready.wait(result).unwrap();
+        }
+        match result.as_ref().expect("dial result initialized") {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.clone()),
+        }
+    }
 }
 
 enum DialChoice {
@@ -72,7 +128,7 @@ impl Dialer {
     fn new(peer: OutboundConfig) -> Self {
         Self {
             peer,
-            tcp_session: Mutex::new(None),
+            tcp_pool: Mutex::new(TcpPoolState::default()),
             state: Mutex::new(DialerState {
                 session: None,
                 selected: TransportChoice::Unknown,
@@ -182,23 +238,52 @@ impl Dialer {
     }
 
     fn tcp_session(&self) -> Result<Session> {
-        let mut slot = self.tcp_session.lock().unwrap();
-        if let Some(session) = slot.as_ref()
-            && !session.is_closed()
-            && session.num_streams() < 100
-        {
-            return Ok(session.clone());
+        loop {
+            let claim = {
+                let mut pool = self.tcp_pool.lock().unwrap();
+                claim_tcp_pool(&mut pool)
+            };
+
+            match claim {
+                TcpPoolClaim::Ready(session) => return Ok(session),
+                TcpPoolClaim::Wait(attempt) => match attempt.wait() {
+                    Ok(()) => continue,
+                    Err(error) => return Err(anyhow!("TCP session dial failed: {error:#}")),
+                },
+                TcpPoolClaim::Lead => {}
+            }
+
+            let result = connect_tcp_session(&self.peer);
+            let attempt = {
+                let mut pool = self.tcp_pool.lock().unwrap();
+                let attempt = pool.attempt.take();
+                if let Ok(session) = &result {
+                    pool.session = Some(session.clone());
+                }
+                attempt
+            };
+            if let Some(attempt) = attempt {
+                attempt.finish(match &result {
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(Arc::new(anyhow!("{error:#}"))),
+                });
+            }
+            return result;
         }
-        let session = connect_tcp_session(&self.peer)?;
-        *slot = Some(session.clone());
-        Ok(session)
     }
 
     fn dial_tcp(&self, target: &str) -> Result<Stream> {
         let session = self.tcp_session()?;
         let result = open_tcp_stream(&session, target);
         if result.is_err() && session.is_closed() {
-            *self.tcp_session.lock().unwrap() = None;
+            let mut pool = self.tcp_pool.lock().unwrap();
+            if pool
+                .session
+                .as_ref()
+                .is_some_and(|current| current.same_session(&session))
+            {
+                pool.session = None;
+            }
         }
         result
     }
@@ -469,8 +554,9 @@ fn format_target(host: &str, port: u16) -> String {
 }
 
 fn connect_tcp_session(peer: &OutboundConfig) -> Result<Session> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let server = format_target(&peer.server, peer.server_port);
-    let handshake = tls::connect_chrome(&server, &peer.dest, peer.insecure)
+    let handshake = tls::connect_chrome_until(&server, &peer.dest, peer.insecure, deadline)
         .with_context(|| format!("outer TLS handshake through {server}"))?;
 
     let server_public = parse_public_key(&peer.public_key)?;
@@ -485,7 +571,10 @@ fn connect_tcp_session(peer: &OutboundConfig) -> Result<Session> {
     )?;
     let mut stream = handshake.stream;
     stream
-        .set_write_timeout(Some(CONNECT_TIMEOUT))
+        .set_write_timeout(Some(remaining_handshake(
+            deadline,
+            "send authentication records",
+        )?))
         .context("set authentication write timeout")?;
     protocol::write_all(&mut stream, &records).context("send mio authentication records")?;
 
@@ -498,8 +587,9 @@ fn connect_tcp_session(peer: &OutboundConfig) -> Result<Session> {
     )?;
     let reader = BufReader::new(stream.try_clone()?);
     let secure = Session::new(stream, reader, send, recv, true);
+    let ready_timeout = READY_TIMEOUT.min(remaining_handshake(deadline, "wait for server ready")?);
     secure
-        .set_read_timeout(Some(READY_TIMEOUT))
+        .set_read_timeout(Some(ready_timeout))
         .context("set ready timeout")?;
     let ready = secure.wait_ready().context("wait for server ready")?;
     let secret = keys.finish(&ready).context("derive hybrid secret")?;
@@ -514,6 +604,14 @@ fn connect_tcp_session(peer: &OutboundConfig) -> Result<Session> {
     secure.set_read_timeout(None).ok();
     secure.start();
     Ok(secure)
+}
+
+fn remaining_handshake(deadline: Instant, phase: &str) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("{phase} timed out");
+    }
+    Ok(remaining)
 }
 
 fn open_tcp_stream(session: &Session, target: &str) -> Result<Stream> {
@@ -551,4 +649,47 @@ fn open_tcp_stream(session: &Session, target: &str) -> Result<Stream> {
 fn dial_tcp_once(peer: &OutboundConfig, target: &str) -> Result<Stream> {
     let session = connect_tcp_session(peer)?;
     open_tcp_stream(&session, target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn tcp_pool_claims_only_one_leader() {
+        let mut pool = TcpPoolState::default();
+        let first = claim_tcp_pool(&mut pool);
+        let second = claim_tcp_pool(&mut pool);
+        assert!(matches!(first, TcpPoolClaim::Lead));
+        assert!(matches!(second, TcpPoolClaim::Wait(_)));
+        if let TcpPoolClaim::Wait(wait) = second {
+            assert!(Arc::ptr_eq(&wait, pool.attempt.as_ref().unwrap()));
+        }
+    }
+
+    #[test]
+    fn tcp_dial_attempt_shares_one_failure() {
+        let attempt = Arc::new(TcpDialAttempt::new());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let attempt = attempt.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    attempt.wait()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let shared = Arc::new(anyhow!("one shared dial failure"));
+        attempt.finish(Err(shared.clone()));
+        let errors = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap_err())
+            .collect::<Vec<_>>();
+        assert!(Arc::ptr_eq(&errors[0], &shared));
+        assert!(Arc::ptr_eq(&errors[1], &shared));
+    }
 }

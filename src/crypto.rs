@@ -13,8 +13,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::protocol::{RECORD_APPDATA, RECORD_HEADER_SIZE, max_record_body};
 
-pub const PROTOCOL_VERSION: &str = "0.5.6";
-const AUTH_INFO: &[u8] = b"mio auth 0.5.6";
+pub const PROTOCOL_VERSION: &str = "0.5.7";
+const AUTH_INFO: &[u8] = b"mio auth 0.5.7";
 pub const AUTH_PLAIN_SIZE: usize = 71;
 const MAX_AUTH_PLAIN: usize = 256;
 const MAX_SHARE_PADDING: usize = 255;

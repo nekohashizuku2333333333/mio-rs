@@ -11,7 +11,7 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 unsafe extern "C" {
     fn SSL_get_x25519_key_share_private_key(ssl: *const ffi::SSL, out: *mut u8) -> c_int;
@@ -185,15 +185,30 @@ fn chrome_ssl(context: &SslContext, server_name: &str, insecure: bool) -> Result
 }
 
 pub fn connect_chrome(server: &str, dest: &str, insecure: bool) -> Result<TlsHandshake> {
+    connect_chrome_until(
+        server,
+        dest,
+        insecure,
+        Instant::now() + TLS_HANDSHAKE_TIMEOUT,
+    )
+}
+
+pub fn connect_chrome_until(
+    server: &str,
+    dest: &str,
+    insecure: bool,
+    deadline: Instant,
+) -> Result<TlsHandshake> {
     let context = chrome_context()?;
     let mut last_error = None;
     for address in server
         .to_socket_addrs()
         .with_context(|| format!("resolve server {server}"))?
     {
-        match TcpStream::connect_timeout(&address, TLS_HANDSHAKE_TIMEOUT) {
+        let remaining = remaining_until(deadline, "TCP connect")?;
+        match TcpStream::connect_timeout(&address, remaining) {
             Ok(stream) => {
-                return finish_handshake(context, stream, dest, insecure)
+                return finish_handshake(context, stream, dest, insecure, deadline)
                     .with_context(|| format!("TLS handshake with {address}"));
             }
             Err(error) => last_error = Some(error),
@@ -204,18 +219,27 @@ pub fn connect_chrome(server: &str, dest: &str, insecure: bool) -> Result<TlsHan
         .unwrap_or_else(|| anyhow!("server {server} resolved to no addresses")))
 }
 
+fn remaining_until(deadline: Instant, phase: &str) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("{phase} timed out");
+    }
+    Ok(remaining)
+}
+
 fn finish_handshake(
     context: SslContext,
     stream: TcpStream,
     dest: &str,
     insecure: bool,
+    deadline: Instant,
 ) -> Result<TlsHandshake> {
     stream.set_nodelay(true).context("enable TCP_NODELAY")?;
     stream
-        .set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT))
+        .set_read_timeout(Some(remaining_until(deadline, "TLS handshake")?))
         .context("set TLS handshake read timeout")?;
     stream
-        .set_write_timeout(Some(TLS_HANDSHAKE_TIMEOUT))
+        .set_write_timeout(Some(remaining_until(deadline, "TLS handshake")?))
         .context("set TLS handshake write timeout")?;
 
     let handshaking = Arc::new(AtomicBool::new(true));
@@ -266,6 +290,10 @@ fn finish_handshake(
     if key_available != 1 {
         bail!("TLS handshake did not expose the X25519 key_share private key");
     }
+    tls.get_mut()
+        .stream
+        .set_write_timeout(Some(remaining_until(deadline, "flush TLS handshake")?))
+        .context("set TLS handshake flush timeout")?;
     tls.flush().context("flush TLS handshake")?;
     let io = tls.into_inner();
     io.stream

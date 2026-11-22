@@ -13,7 +13,7 @@ use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -22,12 +22,13 @@ use x25519_dalek::PublicKey;
 
 use crate::crypto::hkdf_key;
 
-const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.6";
+const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.5.7";
 
 const QUIC_V1_VERSION: u32 = 1;
 const MAX_PENDING_PACKETS: usize = 4;
 const MAX_UNKNOWN_FLOWS: usize = 1024;
 const RELAY_BUFFER_SIZE: usize = 2048;
+const DEST_REFRESH: Duration = Duration::from_secs(5 * 60);
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MIO_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -90,13 +91,25 @@ impl ReplayCache {
         if !valid {
             return false;
         }
-        self.seen
-            .retain(|_, expiration| *expiration > Instant::now());
         if self.seen.contains_key(&nonce) {
             return false;
         }
         self.seen.insert(nonce, Instant::now() + MARKER_RETENTION);
         true
+    }
+
+    fn sweep(&mut self, now: Instant) {
+        self.seen.retain(|_, expiration| *expiration > now);
+    }
+}
+
+async fn resolve_udp_destination(host: &str, port: u16) -> Option<SocketAddr> {
+    tokio::net::lookup_host((host, port)).await.ok()?.next()
+}
+
+fn update_destination(destination: &RwLock<Option<SocketAddr>>, resolved: Option<SocketAddr>) {
+    if let Some(address) = resolved {
+        *destination.write().unwrap() = Some(address);
     }
 }
 
@@ -112,7 +125,9 @@ pub struct UdpDemuxSocket {
     incoming_tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
     incoming_rx: Mutex<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
     marker_key: [u8; 32],
-    destination: Option<SocketAddr>,
+    destination_host: String,
+    destination_port: u16,
+    destination: Arc<RwLock<Option<SocketAddr>>>,
     flows: Arc<Mutex<HashMap<SocketAddr, Flow>>>,
     unknown_flows: Arc<AtomicUsize>,
     replay: Arc<Mutex<ReplayCache>>,
@@ -123,7 +138,9 @@ impl fmt::Debug for UdpDemuxSocket {
         formatter
             .debug_struct("UdpDemuxSocket")
             .field("local_addr", &self.socket.local_addr())
-            .field("destination", &self.destination)
+            .field("destination_host", &self.destination_host)
+            .field("destination_port", &self.destination_port)
+            .field("destination", &*self.destination.read().unwrap())
             .finish_non_exhaustive()
     }
 }
@@ -132,7 +149,8 @@ impl UdpDemuxSocket {
     pub async fn bind(
         address: SocketAddr,
         server_public: PublicKey,
-        destination: Option<SocketAddr>,
+        destination_host: String,
+        destination_port: u16,
         stop: Arc<AtomicBool>,
     ) -> io::Result<Arc<Self>> {
         let socket = socket2::Socket::new(
@@ -152,13 +170,22 @@ impl UdpDemuxSocket {
         let socket = Arc::new(socket);
         let marker_key =
             hkdf_key(server_public.as_bytes(), &[], QUIC_MARKER_INFO).map_err(io::Error::other)?;
+        let initial_destination =
+            resolve_udp_destination(&destination_host, destination_port).await;
+        if initial_destination.is_none() {
+            log::warn!(
+                "cannot resolve UDP destination {destination_host}:{destination_port}; unmarked traffic will be dropped until refresh succeeds"
+            );
+        }
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let demux = Arc::new(Self {
             socket,
             incoming_tx,
             incoming_rx: Mutex::new(incoming_rx),
             marker_key,
-            destination,
+            destination_host,
+            destination_port,
+            destination: Arc::new(RwLock::new(initial_destination)),
             flows: Arc::new(Mutex::new(HashMap::new())),
             unknown_flows: Arc::new(AtomicUsize::new(0)),
             replay: Arc::new(Mutex::new(ReplayCache::new())),
@@ -168,7 +195,10 @@ impl UdpDemuxSocket {
         let reader_stop = stop.clone();
         tokio::spawn(async move { reader.read_loop(reader_stop).await });
         let cleaner = demux.clone();
-        tokio::spawn(async move { cleaner.cleanup_loop(stop).await });
+        let cleaner_stop = stop.clone();
+        tokio::spawn(async move { cleaner.cleanup_loop(cleaner_stop).await });
+        let refresher = demux.clone();
+        tokio::spawn(async move { refresher.refresh_destination_loop(stop).await });
         Ok(demux)
     }
 
@@ -271,8 +301,25 @@ impl UdpDemuxSocket {
         }
     }
 
+    async fn refresh_destination_loop(self: Arc<Self>, stop: Arc<AtomicBool>) {
+        let mut ticker = tokio::time::interval(DEST_REFRESH);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume interval's immediate first tick; bind() already resolved once.
+        ticker.tick().await;
+        while !stop.load(Ordering::Relaxed) {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let resolved =
+                        resolve_udp_destination(&self.destination_host, self.destination_port).await;
+                    update_destination(&self.destination, resolved);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+        }
+    }
+
     async fn start_relay(&self, client: SocketAddr, packets: Vec<Vec<u8>>) {
-        let Some(destination) = self.destination else {
+        let Some(destination) = *self.destination.read().unwrap() else {
             return;
         };
         let bind_address = if destination.is_ipv4() {
@@ -336,6 +383,7 @@ impl UdpDemuxSocket {
         while !stop.load(Ordering::Relaxed) {
             ticker.tick().await;
             let now = Instant::now();
+            self.replay.lock().unwrap().sweep(now);
             let mut flows = self.flows.lock().unwrap();
             let expired = flows
                 .iter()
@@ -599,6 +647,34 @@ mod tests {
             initial_client_hello_random(&packet),
             (None, InitialStatus::None)
         );
+    }
+
+    #[test]
+    fn destination_refresh_retains_last_good_address() {
+        let old = "127.0.0.1:443".parse().unwrap();
+        let new = "127.0.0.2:8443".parse().unwrap();
+        let destination = RwLock::new(Some(old));
+        update_destination(&destination, None);
+        assert_eq!(*destination.read().unwrap(), Some(old));
+        update_destination(&destination, Some(new));
+        assert_eq!(*destination.read().unwrap(), Some(new));
+    }
+
+    #[test]
+    fn replay_sweep_removes_only_expired_entries() {
+        let now = Instant::now();
+        let live_nonce = [1_u8; MARKER_NONCE_SIZE];
+        let expired_nonce = [2_u8; MARKER_NONCE_SIZE];
+        let mut replay = ReplayCache::new();
+        replay
+            .seen
+            .insert(live_nonce, now + Duration::from_secs(60));
+        replay
+            .seen
+            .insert(expired_nonce, now - Duration::from_secs(1));
+        replay.sweep(now);
+        assert!(replay.seen.contains_key(&live_nonce));
+        assert!(!replay.seen.contains_key(&expired_nonce));
     }
 
     #[test]

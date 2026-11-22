@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const RECORD_HANDSHAKE: u8 = 0x16;
 pub const RECORD_APPDATA: u8 = 0x17;
@@ -84,13 +85,28 @@ pub enum CopyOutcome {
 pub fn copy_records<R: Read, W: Write, F: FnMut(&[u8], &[u8]) -> RecordAction>(
     destination: &mut W,
     source: &mut BufReader<R>,
+    inspect: F,
+) -> io::Result<CopyOutcome> {
+    copy_records_cancellable(destination, source, inspect, None)
+}
+
+/// Like [`copy_records`], but a locally-initiated close suppresses forwarding of a
+/// partial final record. Peer EOF still forwards those bytes so a legitimate truncated
+/// tail is propagated.
+pub fn copy_records_cancellable<R: Read, W: Write, F: FnMut(&[u8], &[u8]) -> RecordAction>(
+    destination: &mut W,
+    source: &mut BufReader<R>,
     mut inspect: F,
+    locally_closed: Option<&AtomicBool>,
 ) -> io::Result<CopyOutcome> {
     let mut header = [0_u8; RECORD_HEADER_SIZE];
     loop {
         let (read, error) = read_up_to(source, &mut header);
         if read != header.len() {
-            if read > 0 {
+            if read > 0
+                && error.is_none()
+                && !locally_closed.is_some_and(|closed| closed.load(Ordering::Acquire))
+            {
                 destination.write_all(&header[..read])?;
             }
             return match error {
@@ -109,7 +125,11 @@ pub fn copy_records<R: Read, W: Write, F: FnMut(&[u8], &[u8]) -> RecordAction>(
         record[..RECORD_HEADER_SIZE].copy_from_slice(&header);
         let (read, error) = read_up_to(source, &mut record[RECORD_HEADER_SIZE..]);
         if read != length {
-            destination.write_all(&record[..RECORD_HEADER_SIZE + read])?;
+            if error.is_none()
+                && !locally_closed.is_some_and(|closed| closed.load(Ordering::Acquire))
+            {
+                destination.write_all(&record[..RECORD_HEADER_SIZE + read])?;
+            }
             return match error {
                 Some(error) => Err(error),
                 None => Ok(CopyOutcome::EndOfStream),
@@ -134,6 +154,7 @@ fn read_up_to<R: Read>(source: &mut R, buffer: &mut [u8]) -> (usize, Option<io::
             Ok(0) => break,
             Ok(count) => read += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return (read, None),
             Err(error) => return (read, Some(error)),
         }
     }
@@ -346,6 +367,57 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, CopyOutcome::EndOfStream);
         assert_eq!(output, records);
+    }
+
+    struct FailingReader {
+        bytes: Vec<u8>,
+        fail_after: usize,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.bytes.is_empty() {
+                return Err(io::Error::other("injected read error"));
+            }
+            let count = buffer.len().min(self.bytes.len()).min(self.fail_after);
+            if count == 0 {
+                return Err(io::Error::other("injected read error"));
+            }
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes.drain(..count);
+            self.fail_after -= count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn copy_records_discards_partial_record_on_error() {
+        let source = FailingReader {
+            bytes: vec![RECORD_APPDATA, 3, 3, 0, 8, 1, 2],
+            fail_after: 7,
+        };
+        let mut output = Vec::new();
+        let result = copy_records(&mut output, &mut BufReader::new(source), |_, _| {
+            RecordAction::Forward
+        });
+        assert!(result.is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn copy_records_discards_partial_record_after_local_close() {
+        let partial = [RECORD_APPDATA, 3, 3, 0, 8, 1, 2];
+        let locally_closed = AtomicBool::new(true);
+        let mut output = Vec::new();
+        let outcome = copy_records_cancellable(
+            &mut output,
+            &mut BufReader::new(partial.as_slice()),
+            |_, _| RecordAction::Forward,
+            Some(&locally_closed),
+        )
+        .unwrap();
+        assert_eq!(outcome, CopyOutcome::EndOfStream);
+        assert!(output.is_empty());
     }
 
     #[test]
