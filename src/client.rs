@@ -11,13 +11,21 @@ use crate::config::OutboundConfig;
 use crate::crypto::{ClientKeys, auth_records, parse_public_key, transport_keys, x25519_shared};
 use crate::protocol;
 use crate::quic::{QuicSession, QuicStream, TargetConnectFailed};
-use crate::session::{Session, Stream};
+use crate::session::{MAX_SESSION_STREAMS, Session, Stream, StreamLimitReached};
 use crate::tls;
 use x25519_dalek::StaticSecret;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
+const MIN_FIRST_PROBE_DELAY: Duration = Duration::from_secs(1);
+const MAX_FIRST_PROBE_DELAY: Duration = Duration::from_secs(10);
+const MIN_PROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const DIAL_TIME_LIMIT: Duration = Duration::from_secs(25);
+const MIN_FALLBACK_DELAY: Duration = Duration::from_millis(250);
+const MAX_FALLBACK_DELAY: Duration = Duration::from_secs(1);
+const PROBE_HEAD_START: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone)]
 struct SocksRequest {
@@ -35,22 +43,24 @@ struct TcpTargetConnectFailed;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransportChoice {
-    Unknown,
     Tcp,
     Quic,
 }
 
 struct DialerState {
-    session: Option<Arc<QuicSession>>,
-    selected: TransportChoice,
-    probing: bool,
-    next_probe: Instant,
+    preferred: TransportChoice,
+    latency: Duration,
+    next_probe: Option<Instant>,
+    generation: u64,
+    quic: Option<Arc<QuicSession>>,
+    quic_dial: Option<Arc<QuicDialAttempt>>,
 }
 
 struct Dialer {
     peer: OutboundConfig,
     tcp_pool: Mutex<TcpPoolState>,
     state: Mutex<DialerState>,
+    stop: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -75,7 +85,8 @@ fn claim_tcp_pool(pool: &mut TcpPoolState) -> TcpPoolClaim {
     if let Some(session) = pool
         .sessions
         .iter()
-        .find(|session| session.num_streams() < 100)
+        .rev()
+        .find(|session| session.num_streams() < MAX_SESSION_STREAMS)
     {
         return TcpPoolClaim::Ready(session.clone());
     }
@@ -99,10 +110,17 @@ impl TcpDialAttempt {
         self.ready.notify_all();
     }
 
-    fn wait(&self) -> Result<(), Arc<anyhow::Error>> {
+    fn wait(&self, stop: &AtomicBool) -> Result<(), Arc<anyhow::Error>> {
         let mut result = self.result.lock().unwrap();
         while result.is_none() {
-            result = self.ready.wait(result).unwrap();
+            if stop.load(Ordering::Acquire) {
+                return Err(Arc::new(anyhow!("dialer stopped")));
+            }
+            let (next, _) = self
+                .ready
+                .wait_timeout(result, Duration::from_millis(100))
+                .unwrap();
+            result = next;
         }
         match result.as_ref().expect("dial result initialized") {
             Ok(()) => Ok(()),
@@ -111,162 +129,309 @@ impl TcpDialAttempt {
     }
 }
 
-enum DialChoice {
-    Probe,
-    Tcp,
-    Quic(Arc<QuicSession>),
+struct QuicDialAttempt {
+    result: Mutex<Option<Result<Arc<QuicSession>, Arc<anyhow::Error>>>>,
+    ready: Condvar,
 }
 
-struct ProbeResult {
+impl QuicDialAttempt {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn finish(&self, result: Result<Arc<QuicSession>, Arc<anyhow::Error>>) {
+        *self.result.lock().unwrap() = Some(result);
+        self.ready.notify_all();
+    }
+
+    fn wait(&self, stop: &AtomicBool) -> Result<Arc<QuicSession>> {
+        let mut result = self.result.lock().unwrap();
+        while result.is_none() {
+            if stop.load(Ordering::Acquire) {
+                bail!("dialer stopped");
+            }
+            let (next, _) = self
+                .ready
+                .wait_timeout(result, Duration::from_millis(100))
+                .unwrap();
+            result = next;
+        }
+        match result.as_ref().expect("QUIC dial result initialized") {
+            Ok(session) => Ok(session.clone()),
+            Err(error) => Err(anyhow!("QUIC session dial failed: {error:#}")),
+        }
+    }
+}
+
+struct DialResult {
     transport: TransportChoice,
-    tcp: Option<Session>,
-    quic: Option<Arc<QuicSession>>,
+    connection: Option<ProxyConnection>,
+    elapsed: Duration,
     error: Option<anyhow::Error>,
 }
 
-impl ProbeResult {
-    fn tcp(session: Session) -> Self {
-        Self {
-            transport: TransportChoice::Tcp,
-            tcp: Some(session),
-            quic: None,
-            error: None,
+impl DialResult {
+    fn close(mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.close();
         }
     }
+}
 
-    fn quic(session: Arc<QuicSession>) -> Self {
-        Self {
-            transport: TransportChoice::Quic,
-            tcp: None,
-            quic: Some(session),
-            error: None,
-        }
-    }
-
-    fn failed(transport: TransportChoice, error: anyhow::Error) -> Self {
-        Self {
-            transport,
-            tcp: None,
-            quic: None,
-            error: Some(error),
-        }
-    }
-
+impl ProxyConnection {
     fn close(self) {
-        if let Some(session) = self.tcp {
-            session.close();
-        }
-        if let Some(session) = self.quic {
-            session.close();
+        match self {
+            Self::Tcp(stream) => {
+                let _ = stream.close();
+            }
+            Self::Quic(stream) => drop(stream),
         }
     }
 }
 
 impl Dialer {
-    fn new(peer: OutboundConfig) -> Self {
+    fn new(peer: OutboundConfig, stop: Arc<AtomicBool>) -> Self {
         Self {
             peer,
             tcp_pool: Mutex::new(TcpPoolState::default()),
             state: Mutex::new(DialerState {
-                session: None,
-                selected: TransportChoice::Unknown,
-                probing: false,
-                next_probe: Instant::now(),
+                preferred: TransportChoice::Tcp,
+                latency: Duration::ZERO,
+                next_probe: None,
+                generation: 0,
+                quic: None,
+                quic_dial: None,
             }),
+            stop,
         }
     }
 
     fn dial(self: &Arc<Self>, target: &str) -> Result<ProxyConnection> {
-        let choice = {
+        if self.stop.load(Ordering::Acquire) {
+            bail!("dialer stopped");
+        }
+        let (preferred, generation, delay) = {
             let mut state = self.state.lock().unwrap();
-            if state.probing {
-                match (&state.session, state.selected) {
-                    (Some(session), TransportChoice::Quic) if !session.is_closed() => {
-                        DialChoice::Quic(session.clone())
-                    }
-                    _ => DialChoice::Tcp,
-                }
-            } else if state.selected == TransportChoice::Unknown
-                || Instant::now() >= state.next_probe
-            {
-                state.probing = true;
-                DialChoice::Probe
+            let now = Instant::now();
+            let mut delay = if state.latency.is_zero() {
+                MIN_FALLBACK_DELAY
             } else {
-                match (&state.session, state.selected) {
-                    (Some(session), TransportChoice::Quic) if !session.is_closed() => {
-                        DialChoice::Quic(session.clone())
-                    }
-                    _ => DialChoice::Tcp,
-                }
+                (state.latency * 2).clamp(MIN_FALLBACK_DELAY, MAX_FALLBACK_DELAY)
+            };
+            if state.next_probe.is_some_and(|next| now >= next) {
+                delay = PROBE_HEAD_START;
+                state.next_probe =
+                    Some(now + random_duration(MIN_PROBE_INTERVAL, MAX_PROBE_INTERVAL));
             }
+            (state.preferred, state.generation, delay)
         };
 
-        match choice {
-            DialChoice::Probe => self.probe(target),
-            DialChoice::Tcp => self.dial_tcp_transport(target),
-            DialChoice::Quic(session) => self.dial_quic_transport(target, session),
-        }
-    }
+        let backup = match preferred {
+            TransportChoice::Tcp => TransportChoice::Quic,
+            TransportChoice::Quic => TransportChoice::Tcp,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.start_dial(&sender, preferred, target);
 
-    fn dial_tcp_transport(&self, target: &str) -> Result<ProxyConnection> {
-        match self.dial_tcp(target) {
-            Ok(stream) => Ok(ProxyConnection::Tcp(stream)),
-            Err(tcp_error) if is_target_failure(&tcp_error) => Err(tcp_error),
-            Err(tcp_error) => {
-                // A TCP transport failure may still be recoverable over QUIC.
-                let session = self.state.lock().unwrap().session.clone();
-                let Some(session) = session.filter(|session| !session.is_closed()) else {
-                    return Err(tcp_error);
-                };
-                match session.dial_stream(target) {
-                    Ok(stream) => {
-                        self.install_quic(session);
-                        Ok(ProxyConnection::Quic(stream))
+        let deadline = Instant::now() + DIAL_TIME_LIMIT;
+        let mut backup_started = false;
+        let mut pending = 1usize;
+        let mut errors = Vec::new();
+        let mut current_delay = delay;
+
+        while pending > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                drain_results(receiver);
+                return Err(anyhow!("mio dial timed out: {}", errors.join("; ")));
+            }
+            let wait = if backup_started {
+                deadline.saturating_duration_since(now)
+            } else {
+                current_delay.min(deadline.saturating_duration_since(now))
+            };
+            match receiver.recv_timeout(wait) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !backup_started => {
+                    backup_started = true;
+                    self.start_dial(&sender, backup, target);
+                    pending += 1;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    drain_results(receiver);
+                    return Err(anyhow!("mio dial timed out: {}", errors.join("; ")));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow!("dial result channel closed: {}", errors.join("; ")));
+                }
+                Ok(mut result) => {
+                    pending -= 1;
+                    if let Some(error) = result.error.take() {
+                        let target_failure = is_target_failure(&error);
+                        let transport = result.transport;
+                        result.close();
+                        if transport == preferred && target_failure {
+                            if pending > 0 {
+                                drain_results(receiver);
+                            }
+                            return Err(error);
+                        }
+                        errors.push(format!("{error:#}"));
+                        if !backup_started {
+                            backup_started = true;
+                            self.start_dial(&sender, backup, target);
+                            pending += 1;
+                        }
+                        continue;
                     }
-                    Err(quic_error) => Err(anyhow!(
-                        "TCP failed: {tcp_error:#}; QUIC fallback failed: {quic_error:#}"
-                    )),
+                    let transport = result.transport;
+                    let elapsed = result.elapsed;
+                    let connection = result
+                        .connection
+                        .take()
+                        .ok_or_else(|| anyhow!("successful dial has no connection"))?;
+                    self.record_success(generation, transport, elapsed);
+                    if pending > 0 {
+                        drain_results(receiver);
+                    }
+                    return Ok(connection);
                 }
             }
+            current_delay = Duration::ZERO;
+        }
+        Err(anyhow!("all transports failed: {}", errors.join("; ")))
+    }
+
+    fn start_dial(
+        self: &Arc<Self>,
+        sender: &std::sync::mpsc::Sender<DialResult>,
+        transport: TransportChoice,
+        target: &str,
+    ) {
+        let dialer = self.clone();
+        let target = target.to_string();
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = match dialer.dial_transport(transport, &target) {
+                Ok(connection) => DialResult {
+                    transport,
+                    connection: Some(connection),
+                    elapsed: started.elapsed(),
+                    error: None,
+                },
+                Err(error) => DialResult {
+                    transport,
+                    connection: None,
+                    elapsed: started.elapsed(),
+                    error: Some(error),
+                },
+            };
+            if let Err(result) = sender.send(result) {
+                result.0.close();
+            }
+        });
+    }
+
+    fn dial_transport(
+        self: &Arc<Self>,
+        transport: TransportChoice,
+        target: &str,
+    ) -> Result<ProxyConnection> {
+        match transport {
+            TransportChoice::Tcp => self.dial_tcp(target).map(ProxyConnection::Tcp),
+            TransportChoice::Quic => self
+                .quic_session()?
+                .dial_stream_timeout(target, DIAL_TIME_LIMIT)
+                .map(ProxyConnection::Quic),
         }
     }
 
-    fn dial_quic_transport(
-        &self,
-        target: &str,
-        session: Arc<QuicSession>,
-    ) -> Result<ProxyConnection> {
-        match session.dial_stream(target) {
-            Ok(stream) => Ok(ProxyConnection::Quic(stream)),
-            Err(error) if is_target_failure(&error) => Err(error),
-            Err(error) => {
-                warn!("QUIC stream failed for {target}, falling back to TCP: {error:#}");
-                session.close();
-                let mut state = self.state.lock().unwrap();
-                if state
-                    .session
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &session))
-                {
-                    state.session = None;
-                }
-                state.selected = TransportChoice::Tcp;
-                drop(state);
-                self.dial_tcp(target).map(ProxyConnection::Tcp)
+    fn quic_session(self: &Arc<Self>) -> Result<Arc<QuicSession>> {
+        if self.stop.load(Ordering::Acquire) {
+            bail!("dialer stopped");
+        }
+        let attempt = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(session) = state.quic.as_ref().filter(|session| !session.is_closed()) {
+                return Ok(session.clone());
             }
+            state.quic = None;
+            if let Some(attempt) = state.quic_dial.as_ref() {
+                attempt.clone()
+            } else {
+                let attempt = Arc::new(QuicDialAttempt::new());
+                state.quic_dial = Some(attempt.clone());
+                let dialer = self.clone();
+                let connect_attempt = attempt.clone();
+                std::thread::spawn(move || dialer.connect_quic(connect_attempt));
+                attempt
+            }
+        };
+        attempt.wait(&self.stop)
+    }
+
+    fn connect_quic(self: &Arc<Self>, attempt: Arc<QuicDialAttempt>) {
+        let result = QuicSession::connect(&self.peer).map(Arc::new);
+        let result = if self.stop.load(Ordering::Acquire) {
+            if let Ok(session) = &result {
+                session.close();
+            }
+            Err(anyhow!("dialer stopped"))
+        } else {
+            result
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            if state
+                .quic_dial
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &attempt))
+            {
+                state.quic_dial = None;
+            }
+            if let Ok(session) = &result {
+                state.quic = Some(session.clone());
+            }
+        }
+        attempt.finish(result.map_err(|error| Arc::new(anyhow!("{error:#}"))));
+    }
+
+    fn record_success(&self, generation: u64, transport: TransportChoice, elapsed: Duration) {
+        let mut state = self.state.lock().unwrap();
+        if generation != state.generation || self.stop.load(Ordering::Acquire) {
+            return;
+        }
+        if state.preferred != transport {
+            state.preferred = transport;
+            state.generation += 1;
+            state.latency = elapsed;
+            state.next_probe =
+                Some(Instant::now() + random_duration(MIN_PROBE_INTERVAL, MAX_PROBE_INTERVAL));
+        } else if state.latency.is_zero() {
+            state.latency = elapsed;
+            state.next_probe = Some(
+                Instant::now() + random_duration(MIN_FIRST_PROBE_DELAY, MAX_FIRST_PROBE_DELAY),
+            );
+        } else {
+            state.latency = state.latency * 3 / 4 + elapsed / 4;
         }
     }
 
     fn tcp_session(&self) -> Result<Session> {
         loop {
+            if self.stop.load(Ordering::Acquire) {
+                bail!("dialer stopped");
+            }
             let claim = {
                 let mut pool = self.tcp_pool.lock().unwrap();
                 claim_tcp_pool(&mut pool)
             };
-
             match claim {
                 TcpPoolClaim::Ready(session) => return Ok(session),
-                TcpPoolClaim::Wait(attempt) => match attempt.wait() {
+                TcpPoolClaim::Wait(attempt) => match attempt.wait(&self.stop) {
                     Ok(()) => continue,
                     Err(error) => return Err(anyhow!("TCP session dial failed: {error:#}")),
                 },
@@ -274,6 +439,14 @@ impl Dialer {
             }
 
             let result = connect_tcp_session(&self.peer);
+            let result = if self.stop.load(Ordering::Acquire) {
+                if let Ok(session) = &result {
+                    session.close();
+                }
+                Err(anyhow!("dialer stopped"))
+            } else {
+                result
+            };
             let attempt = {
                 let mut pool = self.tcp_pool.lock().unwrap();
                 let attempt = pool.attempt.take();
@@ -293,142 +466,52 @@ impl Dialer {
     }
 
     fn dial_tcp(&self, target: &str) -> Result<Stream> {
-        let session = self.tcp_session()?;
-        let result = open_tcp_stream(&session, target);
-        if result.is_err() && session.is_closed() {
-            self.tcp_pool
-                .lock()
-                .unwrap()
-                .sessions
-                .retain(|current| !current.same_session(&session));
-        }
-        result
-    }
-
-    fn add_tcp_session(&self, session: Session) {
-        self.tcp_pool.lock().unwrap().sessions.push(session);
-    }
-
-    fn probe(self: &Arc<Self>, target: &str) -> Result<ProxyConnection> {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let tcp_sender = sender.clone();
-        let tcp_peer = self.peer.clone();
-        std::thread::spawn(move || {
-            let result = match connect_tcp_session(&tcp_peer) {
-                Ok(session) => ProbeResult::tcp(session),
-                Err(error) => ProbeResult::failed(TransportChoice::Tcp, error),
-            };
-            let _ = tcp_sender.send(result);
-        });
-
-        let quic_peer = self.peer.clone();
-        std::thread::spawn(move || {
-            let result = match QuicSession::connect(&quic_peer) {
-                Ok(session) => ProbeResult::quic(Arc::new(session)),
-                Err(error) => ProbeResult::failed(TransportChoice::Quic, error),
-            };
-            let _ = sender.send(result);
-        });
-
-        let mut receiver = Some(receiver);
-        let mut errors = Vec::new();
         for _ in 0..2 {
-            let result = match receiver.as_ref().expect("probe receiver").recv() {
-                Ok(result) => result,
+            let session = self.tcp_session()?;
+            match open_tcp_stream(&session, target) {
+                Ok(stream) => return Ok(stream),
+                Err(error) if is_stream_limit(&error) => continue,
                 Err(error) => {
-                    self.finish_probe_failure();
-                    return Err(anyhow!("transport probe channel failed: {error}"));
+                    if session.is_closed() {
+                        self.tcp_pool
+                            .lock()
+                            .unwrap()
+                            .sessions
+                            .retain(|current| !current.same_session(&session));
+                    }
+                    return Err(error);
                 }
-            };
-            let ProbeResult {
-                transport,
-                tcp,
-                quic,
-                error,
-            } = result;
-            if let Some(error) = error {
-                errors.push(format!("{error:#}"));
-                continue;
             }
-            if let Some(session) = tcp {
-                self.add_tcp_session(session);
-            }
-            let active_quic = self.finish_probe(transport, quic);
-            let remaining = receiver.take().expect("probe receiver");
-            std::thread::spawn(move || {
-                for result in remaining {
-                    result.close();
-                }
-            });
-            return match transport {
-                TransportChoice::Tcp => self.dial_tcp_transport(target),
-                TransportChoice::Quic => {
-                    let session = active_quic
-                        .ok_or_else(|| anyhow!("QUIC probe succeeded without a session"))?;
-                    self.dial_quic_transport(target, session)
-                }
-                TransportChoice::Unknown => unreachable!("probe result has no transport"),
-            };
         }
-        self.finish_probe_failure();
-        Err(anyhow!(
-            "both transport probes failed: {}",
-            errors.join("; ")
-        ))
+        bail!("all TCP sessions reached the stream limit")
     }
 
-    fn finish_probe(
-        &self,
-        transport: TransportChoice,
-        quic: Option<Arc<QuicSession>>,
-    ) -> Option<Arc<QuicSession>> {
-        let mut discard = None;
-        let active = {
+    fn close(&self) {
+        let quic = {
             let mut state = self.state.lock().unwrap();
-            state.probing = false;
-            if transport == TransportChoice::Quic {
-                if let Some(session) = quic {
-                    match state.session.clone() {
-                        Some(existing) if !existing.is_closed() => {
-                            // Keep serving streams on the established session.
-                            discard = Some(session);
-                        }
-                        Some(existing) => {
-                            discard = Some(existing);
-                            state.session = Some(session);
-                        }
-                        None => state.session = Some(session),
-                    }
-                }
-            } else if state
-                .session
-                .as_ref()
-                .is_some_and(|session| session.is_closed())
-            {
-                state.session = None;
-            }
-            state.selected = transport;
-            state.next_probe = Instant::now() + random_probe_interval();
-            state.session.clone()
+            state.next_probe = None;
+            state.quic.take()
         };
-        if let Some(session) = discard {
+        if let Some(session) = quic {
             session.close();
         }
-        info!("transport selected: {transport:?}");
-        active
-    }
-
-    fn finish_probe_failure(&self) {
-        self.state.lock().unwrap().probing = false;
-    }
-
-    fn install_quic(&self, session: Arc<QuicSession>) {
-        let mut state = self.state.lock().unwrap();
-        state.session = Some(session);
-        state.selected = TransportChoice::Quic;
+        let sessions = {
+            let mut pool = self.tcp_pool.lock().unwrap();
+            std::mem::take(&mut pool.sessions)
+        };
+        for session in sessions {
+            session.close();
+        }
     }
 }
 
+fn drain_results(receiver: std::sync::mpsc::Receiver<DialResult>) {
+    std::thread::spawn(move || {
+        for result in receiver {
+            result.close();
+        }
+    });
+}
 fn is_target_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<TargetConnectFailed>().is_some()
@@ -436,9 +519,16 @@ fn is_target_failure(error: &anyhow::Error) -> bool {
     })
 }
 
-fn random_probe_interval() -> Duration {
-    let seconds = rand::thread_rng().gen_range(10 * 60..=30 * 60);
-    Duration::from_secs(seconds)
+fn is_stream_limit(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<StreamLimitReached>().is_some())
+}
+
+fn random_duration(minimum: Duration, maximum: Duration) -> Duration {
+    let min_ms = minimum.as_millis() as u64;
+    let max_ms = maximum.as_millis() as u64;
+    Duration::from_millis(rand::thread_rng().gen_range(min_ms..=max_ms))
 }
 
 pub fn run(outbound: OutboundConfig, stop: Arc<AtomicBool>) -> Result<()> {
@@ -449,7 +539,7 @@ pub fn run(outbound: OutboundConfig, stop: Arc<AtomicBool>) -> Result<()> {
         .set_nonblocking(true)
         .context("configure SOCKS5 listener")?;
     info!("SOCKS5 listening on {}", listener.local_addr()?);
-    let dialer = Arc::new(Dialer::new(outbound));
+    let dialer = Arc::new(Dialer::new(outbound, stop.clone()));
 
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -467,6 +557,7 @@ pub fn run(outbound: OutboundConfig, stop: Arc<AtomicBool>) -> Result<()> {
             Err(error) => return Err(error).context("accept SOCKS5 connection"),
         }
     }
+    dialer.close();
     Ok(())
 }
 
@@ -677,6 +768,35 @@ mod tests {
     }
 
     #[test]
+    fn initial_transport_is_tcp() {
+        let config: OutboundConfig = toml::from_str(
+            r#"
+            socks_listen = "127.0.0.1"
+            socks_listen_port = 1080
+            server = "example.com"
+            dest = "www.example.com"
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "#,
+        )
+        .unwrap();
+        let dialer = Dialer::new(config, Arc::new(AtomicBool::new(false)));
+        let state = dialer.state.lock().unwrap();
+        assert_eq!(state.preferred, TransportChoice::Tcp);
+        assert!(state.quic.is_none());
+        assert!(state.next_probe.is_none());
+    }
+
+    #[test]
+    fn probe_delays_have_expected_bounds() {
+        for _ in 0..20 {
+            let first = random_duration(MIN_FIRST_PROBE_DELAY, MAX_FIRST_PROBE_DELAY);
+            assert!(first >= MIN_FIRST_PROBE_DELAY && first <= MAX_FIRST_PROBE_DELAY);
+            let periodic = random_duration(MIN_PROBE_INTERVAL, MAX_PROBE_INTERVAL);
+            assert!(periodic >= MIN_PROBE_INTERVAL && periodic <= MAX_PROBE_INTERVAL);
+        }
+    }
+
+    #[test]
     fn tcp_dial_attempt_shares_one_failure() {
         let attempt = Arc::new(TcpDialAttempt::new());
         let barrier = Arc::new(Barrier::new(3));
@@ -684,9 +804,10 @@ mod tests {
             .map(|_| {
                 let attempt = attempt.clone();
                 let barrier = barrier.clone();
+                let stop = Arc::new(AtomicBool::new(false));
                 std::thread::spawn(move || {
                     barrier.wait();
-                    attempt.wait()
+                    attempt.wait(&stop)
                 })
             })
             .collect::<Vec<_>>();

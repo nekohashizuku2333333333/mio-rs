@@ -18,8 +18,21 @@ pub const FRAME_WINDOW: u8 = 4;
 pub const FRAME_HEADER_SIZE: usize = 7;
 pub const MAX_FRAME_PAYLOAD: usize = 16384 + 1 + 16 - AEAD_OVERHEAD - FRAME_HEADER_SIZE;
 pub const STREAM_WINDOW: usize = 16 << 20;
-const ACCEPT_BACKLOG: usize = 256;
+pub const SESSION_WINDOW: usize = 32 << 20;
+pub const MAX_SESSION_STREAMS: usize = 100;
+const ACCEPT_BACKLOG: usize = MAX_SESSION_STREAMS;
 const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const SESSION_WINDOW_BATCH: Duration = Duration::from_millis(5);
+
+#[derive(Debug, thiserror::Error)]
+#[error("session stream limit reached")]
+pub struct StreamLimitReached;
+
+enum ControlCommand {
+    Window,
+    Reset(u32),
+    Close,
+}
 
 #[derive(Default)]
 struct WriteGate {
@@ -98,6 +111,10 @@ struct SessionInner {
     send: Mutex<SendState>,
     recv: Mutex<RecvState>,
     session_state: Mutex<SessionState>,
+    credit_ready: Condvar,
+    control_tx: mpsc::Sender<ControlCommand>,
+    control_rx: Mutex<Option<mpsc::Receiver<ControlCommand>>>,
+    window_pending: AtomicBool,
     accept_tx: SyncSender<Arc<StreamState>>,
     accept_rx: Mutex<mpsc::Receiver<Arc<StreamState>>>,
     started: AtomicBool,
@@ -123,6 +140,9 @@ struct SessionState {
     next_id: u32,
     last_peer_id: u32,
     unopened: usize,
+    send_credit: usize,
+    recv_credit: usize,
+    recv_consumed: usize,
     error: Option<String>,
 }
 
@@ -178,6 +198,7 @@ impl Session {
         client: bool,
     ) -> Self {
         let (accept_tx, accept_rx) = mpsc::sync_channel(ACCEPT_BACKLOG);
+        let (control_tx, control_rx) = mpsc::channel();
         let inner = Arc::new(SessionInner {
             conn,
             reader: Mutex::new(Some(reader)),
@@ -192,8 +213,14 @@ impl Session {
             }),
             session_state: Mutex::new(SessionState {
                 next_id: 1,
+                send_credit: SESSION_WINDOW,
+                recv_credit: SESSION_WINDOW,
                 ..SessionState::default()
             }),
+            credit_ready: Condvar::new(),
+            control_tx,
+            control_rx: Mutex::new(Some(control_rx)),
+            window_pending: AtomicBool::new(false),
             accept_tx,
             accept_rx: Mutex::new(accept_rx),
             started: AtomicBool::new(false),
@@ -235,6 +262,10 @@ impl Session {
         if self.inner.started.swap(true, Ordering::SeqCst) {
             return;
         }
+        if let Some(control_rx) = self.inner.control_rx.lock().unwrap().take() {
+            let inner = self.inner.clone();
+            std::thread::spawn(move || control_loop(inner, control_rx));
+        }
         let reader = self.inner.reader.lock().unwrap().take();
         if let Some(reader) = reader {
             let inner = self.inner.clone();
@@ -249,6 +280,9 @@ impl Session {
         let mut state = self.inner.session_state.lock().unwrap();
         if state.error.is_some() {
             bail!("session closed");
+        }
+        if state.streams.len() + state.unopened >= MAX_SESSION_STREAMS {
+            return Err(StreamLimitReached.into());
         }
         state.unopened += 1;
         let stream = Stream {
@@ -371,6 +405,78 @@ impl SessionInner {
         }
     }
 
+    fn take_send_credit(&self, limit: usize) -> usize {
+        let mut state = self.session_state.lock().unwrap();
+        let credit = limit.min(state.send_credit);
+        state.send_credit -= credit;
+        credit
+    }
+
+    fn add_send_credit(&self, credit: usize) -> bool {
+        let mut state = self.session_state.lock().unwrap();
+        if credit > SESSION_WINDOW.saturating_sub(state.send_credit) {
+            return false;
+        }
+        state.send_credit += credit;
+        self.credit_ready.notify_all();
+        true
+    }
+
+    fn restore_send_credit(&self, credit: usize) {
+        let mut state = self.session_state.lock().unwrap();
+        state.send_credit += credit;
+        self.credit_ready.notify_all();
+    }
+
+    fn wait_send_credit(&self, deadline: Option<Instant>) -> Result<()> {
+        let mut state = self.session_state.lock().unwrap();
+        loop {
+            if state.error.is_some() {
+                bail!("session closed");
+            }
+            if state.send_credit > 0 {
+                return Ok(());
+            }
+            let next = if let Some(deadline) = deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(
+                        io::Error::new(io::ErrorKind::TimedOut, "stream write timeout").into(),
+                    );
+                }
+                let (next, _) = self
+                    .credit_ready
+                    .wait_timeout(state, deadline.saturating_duration_since(now))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                next
+            } else {
+                self.credit_ready
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            };
+            state = next;
+        }
+    }
+
+    fn take_receive_credit(&self, amount: usize) -> bool {
+        let mut state = self.session_state.lock().unwrap();
+        if amount > state.recv_credit {
+            return false;
+        }
+        state.recv_credit -= amount;
+        true
+    }
+
+    fn release_receive_credit(&self, amount: usize) {
+        if amount == 0 {
+            return;
+        }
+        self.session_state.lock().unwrap().recv_consumed += amount;
+        if !self.window_pending.swap(true, Ordering::AcqRel) {
+            let _ = self.control_tx.send(ControlCommand::Window);
+        }
+    }
+
     fn write_frame(
         &self,
         kind: u8,
@@ -458,8 +564,60 @@ impl SessionInner {
             data.closed = true;
             stream.ready.notify_all();
         }
+        self.credit_ready.notify_all();
+        let _ = self.control_tx.send(ControlCommand::Close);
         self.write_gate.close();
         let _ = self.conn.shutdown(Shutdown::Both);
+    }
+
+    fn receive_data_frame(self: &Arc<Self>, stream_id: u32, payload: &[u8]) -> Result<()> {
+        let amount = payload.len();
+        if !self.take_receive_credit(amount) {
+            bail!("peer exceeded the session window");
+        }
+        if let Some(stream) = self.lookup(stream_id, true) {
+            let mut data = stream.stream.state.lock().unwrap();
+            if data.closed {
+                drop(data);
+                self.release_receive_credit(amount);
+            } else if amount > data.recv_credit {
+                drop(data);
+                bail!("peer exceeded the stream window");
+            } else {
+                data.recv_credit -= amount;
+                data.buffer.extend_from_slice(payload);
+                stream.stream.ready.notify_all();
+            }
+        } else {
+            self.release_receive_credit(amount);
+        }
+        Ok(())
+    }
+
+    fn receive_window_frame(self: &Arc<Self>, stream_id: u32, payload: &[u8]) -> Result<()> {
+        if payload.len() != 4 {
+            bail!("invalid window frame");
+        }
+        let increment =
+            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        if stream_id == 0 {
+            if increment == 0 || increment > SESSION_WINDOW || !self.add_send_credit(increment) {
+                bail!("invalid session window increment");
+            }
+            return Ok(());
+        }
+        if let Some(stream) = self.lookup(stream_id, false) {
+            let mut data = stream.stream.state.lock().unwrap();
+            if increment == 0
+                || increment > STREAM_WINDOW
+                || increment > STREAM_WINDOW.saturating_sub(data.send_credit)
+            {
+                bail!("invalid stream window increment");
+            }
+            data.send_credit += increment;
+            stream.stream.ready.notify_all();
+        }
+        Ok(())
     }
 
     fn remove_stream(&self, stream_id: u32) {
@@ -483,6 +641,11 @@ impl SessionInner {
             return None;
         }
         state.last_peer_id = stream_id;
+        if state.streams.len() >= MAX_SESSION_STREAMS {
+            drop(state);
+            let _ = self.control_tx.send(ControlCommand::Reset(stream_id));
+            return None;
+        }
         let stream_state = Arc::new(StreamState {
             state: Mutex::new(StreamData {
                 id: stream_id,
@@ -501,6 +664,8 @@ impl SessionInner {
             }),
             Err(TrySendError::Full(_)) => {
                 state.streams.remove(&stream_id);
+                drop(state);
+                let _ = self.control_tx.send(ControlCommand::Reset(stream_id));
                 None
             }
             Err(TrySendError::Disconnected(_)) => None,
@@ -535,12 +700,15 @@ impl Stream {
             return Ok(());
         }
         data.closed = true;
+        let discarded = data.buffer.len();
+        data.buffer.clear();
         let id = data.id;
         let known = id != 0;
         let send_close = known && !data.send_closed && !data.reset;
         let send_reset = known && !data.recv_closed && !data.reset;
         data.send_closed = true;
         drop(data);
+        self.session.release_receive_credit(discarded);
         self.stream.ready.notify_all();
         self.session.remove_stream(id);
         if send_close {
@@ -612,6 +780,7 @@ impl Read for Stream {
                 }
                 let id = data.id;
                 drop(data);
+                self.session.release_receive_credit(n);
                 if increment > 0 {
                     let _ = self.session.write_frame(
                         FRAME_WINDOW,
@@ -676,16 +845,24 @@ impl Write for Stream {
                         "stream write timeout",
                     ));
                 }
-                let n = (buffer.len() - total)
+                let available = (buffer.len() - total)
                     .min(data.send_credit)
                     .min(MAX_FRAME_PAYLOAD);
-                if n == 0 {
+                if available == 0 {
                     data = self
                         .stream
                         .ready
                         .wait_timeout(data, Duration::from_millis(100))
                         .unwrap()
                         .0;
+                    continue;
+                }
+                let n = self.session.take_send_credit(available);
+                if n == 0 {
+                    drop(data);
+                    self.session
+                        .wait_send_credit(deadline)
+                        .map_err(write_io_error)?;
                     continue;
                 }
                 data.send_credit -= n;
@@ -698,6 +875,7 @@ impl Write for Stream {
                 .map(|(minimum, maximum)| random_range(minimum, maximum))
                 .unwrap_or_else(|| default_padding(data_frames, n));
             if let Err(error) = self.write_data(&buffer[total..total + n], padding, deadline) {
+                self.session.restore_send_credit(n);
                 let mut data = self.stream.state.lock().unwrap();
                 data.send_credit += n;
                 data.sent_data = data.sent_data.saturating_sub(1);
@@ -743,6 +921,37 @@ fn default_padding(data_frames: u64, payload: usize) -> usize {
     }
 }
 
+fn control_loop(inner: Arc<SessionInner>, receiver: mpsc::Receiver<ControlCommand>) {
+    while let Ok(command) = receiver.recv() {
+        let result = match command {
+            ControlCommand::Close => return,
+            ControlCommand::Reset(id) => inner.write_frame(FRAME_RESET, id, &[], 0, None),
+            ControlCommand::Window => {
+                std::thread::sleep(SESSION_WINDOW_BATCH);
+                let increment = {
+                    let mut state = inner.session_state.lock().unwrap();
+                    // Clear pending before taking the snapshot so a read racing
+                    // with this batch queues another window update.
+                    inner.window_pending.store(false, Ordering::Release);
+                    let increment = state.recv_consumed;
+                    state.recv_consumed = 0;
+                    state.recv_credit += increment;
+                    increment
+                };
+                if increment == 0 {
+                    Ok(())
+                } else {
+                    inner.write_frame(FRAME_WINDOW, 0, &(increment as u32).to_be_bytes(), 0, None)
+                }
+            }
+        };
+        if let Err(error) = result {
+            inner.close_with_error(&error.to_string());
+            return;
+        }
+    }
+}
+
 fn read_loop(inner: Arc<SessionInner>, reader: BufReader<TcpStream>) {
     let mut reader = reader;
     loop {
@@ -750,16 +959,9 @@ fn read_loop(inner: Arc<SessionInner>, reader: BufReader<TcpStream>) {
         match result {
             Ok((kind, id, payload)) => match kind {
                 FRAME_DATA => {
-                    if let Some(stream) = inner.lookup(id, true) {
-                        let mut data = stream.stream.state.lock().unwrap();
-                        if payload.len() > data.recv_credit {
-                            drop(data);
-                            inner.close_with_error("peer exceeded the stream window");
-                            return;
-                        }
-                        data.recv_credit -= payload.len();
-                        data.buffer.extend_from_slice(&payload);
-                        stream.stream.ready.notify_all();
+                    if let Err(error) = inner.receive_data_frame(id, &payload) {
+                        inner.close_with_error(&error.to_string());
+                        return;
                     }
                 }
                 FRAME_CLOSE => {
@@ -774,12 +976,10 @@ fn read_loop(inner: Arc<SessionInner>, reader: BufReader<TcpStream>) {
                         stream.stream.ready.notify_all();
                     }
                 }
-                FRAME_WINDOW if payload.len() == 4 => {
-                    if let Some(stream) = inner.lookup(id, false) {
-                        let increment =
-                            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                        stream.stream.state.lock().unwrap().send_credit += increment as usize;
-                        stream.stream.ready.notify_all();
+                FRAME_WINDOW => {
+                    if let Err(error) = inner.receive_window_frame(id, &payload) {
+                        inner.close_with_error(&error.to_string());
+                        return;
                     }
                 }
                 _ => {}
@@ -851,7 +1051,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let connector = std::thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
         let (server, _) = listener.accept().unwrap();
-        let _peer = connector.join().unwrap();
+        let mut peer = connector.join().unwrap();
+        let _ = peer.set_read_timeout(Some(Duration::from_secs(5)));
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buffer = [0_u8; 8192];
+            while peer.read(&mut buffer).is_ok_and(|count| count > 0) {}
+        });
         let reader = BufReader::new(server.try_clone().unwrap());
         Session::new(
             server,
@@ -909,5 +1115,112 @@ mod tests {
         assert_eq!(data.next_padding, Some((512, 512)));
         drop(data);
         drop(gate);
+    }
+
+    #[test]
+    fn session_window_is_32_mib() {
+        assert_eq!(SESSION_WINDOW, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn session_and_stream_send_credit_are_charged() {
+        let session = test_session();
+        let mut stream = session.open().unwrap();
+        stream.write_all(&[7_u8; 100]).unwrap();
+        assert_eq!(
+            session.inner.session_state.lock().unwrap().send_credit,
+            SESSION_WINDOW - 100
+        );
+        assert_eq!(
+            stream.stream.state.lock().unwrap().send_credit,
+            STREAM_WINDOW - 100
+        );
+    }
+
+    #[test]
+    fn unknown_and_closed_stream_data_returns_session_credit() {
+        let session = test_session();
+        session.inner.receive_data_frame(99, &[1_u8; 10]).unwrap();
+        let stream = session.open().unwrap();
+        {
+            let mut data = stream.stream.state.lock().unwrap();
+            data.id = 1;
+            data.closed = true;
+        }
+        session
+            .inner
+            .session_state
+            .lock()
+            .unwrap()
+            .streams
+            .insert(1, stream.stream.clone());
+        session.inner.receive_data_frame(1, &[2_u8; 7]).unwrap();
+        let state = session.inner.session_state.lock().unwrap();
+        assert_eq!(state.recv_credit, SESSION_WINDOW - 17);
+        assert_eq!(state.recv_consumed, 17);
+    }
+
+    #[test]
+    fn stream_close_returns_unread_session_credit() {
+        let session = test_session();
+        let stream = session.open().unwrap();
+        {
+            let mut data = stream.stream.state.lock().unwrap();
+            data.id = 1;
+        }
+        session
+            .inner
+            .session_state
+            .lock()
+            .unwrap()
+            .streams
+            .insert(1, stream.stream.clone());
+        session.inner.receive_data_frame(1, &[3_u8; 64]).unwrap();
+        stream.close().unwrap();
+        let state = session.inner.session_state.lock().unwrap();
+        assert_eq!(state.recv_consumed, 64);
+        assert_eq!(state.recv_credit, SESSION_WINDOW - 64);
+        assert!(stream.stream.state.lock().unwrap().buffer.is_empty());
+    }
+
+    #[test]
+    fn invalid_window_increments_are_rejected() {
+        let session = test_session();
+        assert!(
+            session
+                .inner
+                .receive_window_frame(0, &0_u32.to_be_bytes())
+                .is_err()
+        );
+        assert!(
+            session
+                .inner
+                .receive_window_frame(0, &(SESSION_WINDOW as u32).to_be_bytes())
+                .is_err()
+        );
+        session.inner.take_send_credit(8);
+        assert!(
+            session
+                .inner
+                .receive_window_frame(0, &(SESSION_WINDOW as u32).to_be_bytes())
+                .is_err()
+        );
+        assert!(session.inner.receive_window_frame(7, &[0_u8; 3]).is_err());
+    }
+
+    #[test]
+    fn open_rejects_after_one_hundred_streams() {
+        let session = test_session();
+        let mut streams = Vec::new();
+        for _ in 0..MAX_SESSION_STREAMS {
+            streams.push(session.open().unwrap());
+        }
+        let error = match session.open() {
+            Ok(_) => panic!("opening a 101st stream must fail"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<StreamLimitReached>().is_some());
+        streams[0].close().unwrap();
+        assert!(session.open().is_ok());
     }
 }

@@ -24,8 +24,8 @@ use crate::udp_demux::UdpDemuxSocket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const QUIC_EXPORTER_LABEL: &[u8] = b"mio quic auth";
-const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.6.0";
-const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.6.0";
+const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.6.2";
+const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.6.2";
 const QUIC_CLIENT_LABEL: &[u8] = b"client";
 const QUIC_SERVER_LABEL: &[u8] = b"server";
 const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -245,9 +245,9 @@ impl QuicSession {
         })?;
         debug!("QUIC congestion control: Quinn experimental BBR, initial_mtu={initial_mtu}");
         let session = Self {
-            runtime,
-            endpoint,
             connection,
+            endpoint,
+            runtime,
         };
         session.authenticate(&server_public)?;
         Ok(session)
@@ -291,16 +291,22 @@ impl QuicSession {
     }
 
     pub fn dial_stream(&self, target: &str) -> Result<QuicStream> {
+        self.dial_stream_timeout(target, QUIC_REPLY_TIMEOUT)
+    }
+
+    pub fn dial_stream_timeout(&self, target: &str, timeout: Duration) -> Result<QuicStream> {
         let mut request = Vec::new();
         protocol::write_request(&mut request, target)?;
+        if timeout.is_zero() {
+            bail!("QUIC target request timed out");
+        }
+        let deadline = Instant::now() + timeout;
+        let open_timeout = timeout.min(QUIC_CONNECT_TIMEOUT);
         let (mut send, mut recv) = self
             .runtime
-            .block_on(async {
-                tokio::time::timeout(QUIC_CONNECT_TIMEOUT, self.connection.open_bi()).await
-            })
+            .block_on(async { tokio::time::timeout(open_timeout, self.connection.open_bi()).await })
             .map_err(|_| anyhow!("open QUIC stream timed out"))?
             .context("open QUIC stream")?;
-        let deadline = Instant::now() + QUIC_REPLY_TIMEOUT;
         let mut reply = [0_u8; 1];
         let result = self.runtime.block_on(async {
             let remaining = deadline.saturating_duration_since(Instant::now());

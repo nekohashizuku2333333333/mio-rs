@@ -1,6 +1,6 @@
-# v0.6.0 差异补全与可行性研究
+# v0.6.2 差异补全与可行性研究
 
-本文记录 Rust 重写与上游 `orgmio/mio` v0.6.0（线上协议 v0.6.0）的逐项差异。
+本文记录 Rust 重写与上游 `orgmio/mio` v0.6.2（线上协议 v0.6.2）的逐项差异。
 
 ## 总览
 
@@ -18,7 +18,7 @@
 
 ## TCP 静态认证
 
-v0.6.0 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
+v0.6.2 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
 
 ```text
 shared = X25519(client TLS key_share private, server static public)
@@ -28,7 +28,7 @@ shared = X25519(client TLS key_share private, server static public)
 握手后客户端连续发送两条记录：
 
 ```text
-key       = HKDF(shared, client_random ‖ server_random, "mio auth 0.6.0")
+key       = HKDF(shared, client_random ‖ server_random, "mio auth 0.6.2")
 认证记录: nonce = 0，plaintext = random_padding(71)
 份额记录: nonce = 1，plaintext = client_share(1216) ‖ random_padding(0–255)
 header    = 17 03 03 ‖ length
@@ -47,19 +47,21 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 
 ## TCP 多路复用
 
-`src/session.rs` 实现 v0.6.0 `Session`：
+`src/session.rs` 实现 v0.6.2 `Session`：
 
 - 帧头：`type(1) ‖ stream_id(4) ‖ payload_length(2)`
 - ready/data/close/reset/window 五种帧
-- 每条流每方向初始接收窗口 16 MiB
+- 每方向 32 MiB 会话窗口；每条流另有 16 MiB 窗口，发送/接收同时计入两层额度
 - 流编号由客户端分配，从 1 递增；服务端收到新编号的第一个 data 帧即创建流
+- 每条 TCP 会话最多 100 条并发流；服务端用 reset 帧拒绝超限的新流
 - 客户端 pool 尽量复用同一条 TCP session，达到 100 条流后再新建
 - 每条流的读写独立阻塞，不阻塞同一 session 的其他流
 - 所有流共享容量为 1 的 write slot；等待者会观察自己的 write deadline 和 session 关闭
-- 每帧写 socket 前设置最长 10 秒写超时；写失败会回滚 sendCredit/sentData/nextPadding
+- 每帧写 socket 前设置最长 10 秒写超时；写失败会同时回滚 session 和 stream 额度、sentData、nextPadding
 - 首帧流编号和记录写入在同一个 write slot 内完成，保持编号和 TLS 记录顺序
+- 会话窗口更新由独立 control loop 合并发送；未知/已关闭流占用后归还的会话额度也会批量返还
 
-本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.6.0 客户端到 Rust 服务端
+本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.6.2 客户端到 Rust 服务端
 也通过了同一条 TCP 连接上的两条流。
 
 ## 服务端 QUIC UDP 分流
@@ -70,7 +72,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 2. 对每个 UDP 源地址维护 `Pending / Mio / Relay` 流状态。
 3. 解密 QUIC v1 Initial 并读取 ClientHello.random。
 4. marker key 由服务端静态公钥经
-   `HKDF(public_key, empty_salt, "mio quic marker 0.6.0")` 派生。
+   `HKDF(public_key, empty_salt, "mio quic marker 0.6.2")` 派生。
 5. 验证 16 字节 nonce + 16 字节分钟级 HMAC，接受当前分钟 ±1 分钟。
 6. 用 replay cache 拒绝重复 marker。
 7. 无 marker 的流按客户端地址建立到 `dest` 的 UDP relay，响应从同一服务端
@@ -80,19 +82,24 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 
 实现位于 `src/client.rs::Dialer`：
 
-- 不再后台预热 QUIC。
-- 首次请求只并行建立并认证 TCP session 与 QUIC session；先成功者决定 transport，
-  然后才在该 transport 上请求目标。
-- 不保存 latency sample，也不做平滑或后台结果合并；仍保留随机 10–30 分钟重探测。
-- probe 产生的新 TCP session 加入 Vec pool；pool 会剔除 closed session，并选择
-  少于 100 条流的会话复用，不再用单 slot 覆盖旧 session。
-- QUIC stream 传输失败时回退 TCP。
-- QUIC 目标请求的 write + reply 共用一个 10 秒 deadline；失败时 CancelRead/CancelWrite。
+- 初始 preferred transport 为 TCP，不再后台预热 QUIC。
+- 每个代理请求先启动 preferred；延迟 250ms–1s 后启动 backup。若已到重新比较时间，
+  head start 缩短到 25ms，让两条路径近似同时竞争。
+- 不单独发起后台 probe：两条路径都直接打开目标连接，先成功者在本次请求获胜；
+  preferred 明确收到目标不可达时立即返回，不等待 backup。
+- 成功后更新 preferred、平滑延迟，并安排下一次比较：首次 1–10 秒，之后 10–30 分钟。
+- QUIC session 在 Dialer 内缓存；并发请求共享同一个 `quicDial` attempt，失败不会排队重试。
+- TCP pool 会剔除 closed session，并选择少于 100 条流的会话复用；并发的 TCP 建连共享
+  同一个 attempt。
+- QUIC 目标请求的 write + reply 共用 deadline；失败时 CancelRead/CancelWrite。
 - TCP 请求 reply 超时且整个会话期间没有收到任何记录时，关闭该僵死 session。
-- TCP pool 的并发建连共享同一个 attempt；失败结果由所有等待者共享，不会逐个重试。
-- TCP 建连、TLS 握手、认证记录和 ready 使用 10 秒总预算（DNS 解析仍受系统解析器限制）。
+- TCP 建连、TLS 握手、认证记录和 ready 使用 10 秒总预算；单次 Dial 总时限 25 秒
+  （DNS 解析仍受系统解析器限制）。
+- `Dialer::close()` 在客户端停止时关闭缓存 QUIC 与所有 TCP session。Rust 同步 API
+  没有 Go context 的完整取消语义。
 
-验证：占用服务端 UDP 端口强制 QUIC bind 失败后，SOCKS5 echo 仍成功并选择 TCP。
+验证：Rust↔Go v0.6.2 的 TCP 强制路径、auto race 和 TCP 两 stream 均通过；
+Go v0.6.2 在该环境默认选择了 TCP，未单独强制其 QUIC 路径。Rust↔Rust QUIC E2E 通过。
 
 ## BoringSSL 与 Chrome 156+
 
@@ -142,5 +149,5 @@ sampler。因此口径是“已启用 Quinn 实验性 BBR”，不是“算法�
   Rust 的 Session 结构不同，暂未逐项照搬，线上帧长度语义保持一致。
 - Rust TCP session pool 没有复刻 Go 客户端 4–6 分钟空闲回收；当前按 100 条流上限或
   session 关闭来换新连接。
-- Go v0.6 已移除 latency smoothing/revision；Rust 同样只采用首个成功 session，
-  落败 session 由清理线程关闭。Rust 的并发请求没有 Go context 取消语义。
+- Rust 同步 API 没有 Go context 的完整取消语义；QUIC 使用显式 timeout/retire，TCP
+  建连仍受同步 DNS 解析和 10 秒握手预算限制。

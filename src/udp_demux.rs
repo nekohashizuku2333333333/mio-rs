@@ -22,7 +22,7 @@ use x25519_dalek::PublicKey;
 
 use crate::crypto::hkdf_key;
 
-const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.6.0";
+const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.6.2";
 
 const QUIC_V1_VERSION: u32 = 1;
 const MAX_PENDING_PACKETS: usize = 4;
