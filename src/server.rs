@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
-use std::io::BufReader;
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::collections::HashMap;
+use std::io::{BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -104,11 +105,13 @@ pub fn run(config: InboundConfig, stop: Arc<AtomicBool>) -> Result<()> {
     info!("mio TCP listening on {}", listener.local_addr()?);
     let quic_config = config.clone();
     let quic_stop = stop.clone();
-    std::thread::spawn(move || {
-        if let Err(error) = quic::run_server(quic_config, quic_stop) {
-            warn!("QUIC disabled: {error:#}");
-        }
-    });
+    if config.udp_enabled() {
+        std::thread::spawn(move || {
+            if let Err(error) = quic::run_server(quic_config, quic_stop) {
+                warn!("QUIC disabled: {error:#}");
+            }
+        });
+    }
 
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -315,21 +318,30 @@ fn serve_connection(
 
 fn proxy_stream(mut stream: Stream) -> Result<()> {
     stream.set_read_timeout(Some(REQUEST_TIMEOUT));
-    let target = protocol::read_request(&mut stream).context("read target request")?;
+    let request = protocol::read_stream_request(&mut stream).context("read stream request")?;
     stream.set_read_timeout(None);
+    stream.set_next_padding(16, 512);
 
+    if request == protocol::StreamRequest::UdpAssociate {
+        protocol::write_reply(&mut stream, true)?;
+        let reader = stream.clone();
+        relay_udp_association(reader, stream).context("relay UDP association")?;
+        return Ok(());
+    }
+
+    let protocol::StreamRequest::Tcp(target) = request else {
+        unreachable!()
+    };
     let remote = match connect_target_from_authority(&target) {
         Ok(remote) => remote,
         Err(error) => {
             warn!("connect target {target} failed: {error:#}");
-            stream.set_next_padding(16, 512);
             protocol::write_reply(&mut stream, false)?;
             stream.close()?;
             return Ok(());
         }
     };
 
-    stream.set_next_padding(16, 512);
     protocol::write_reply(&mut stream, true)?;
     info!("proxy target {target}");
     let reader = stream.clone();
@@ -337,6 +349,114 @@ fn proxy_stream(mut stream: Stream) -> Result<()> {
     protocol::relay_halves(remote, reader, writer).context("relay target traffic")?;
     stream.close()?;
     Ok(())
+}
+
+pub(crate) fn relay_udp_association<R, W>(mut reader: R, writer: W) -> Result<()>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    const MAX_TARGETS: usize = 64;
+    const TARGET_IDLE: Duration = Duration::from_secs(60);
+    const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let writer = Arc::new(Mutex::new(writer));
+    let targets_map = Arc::new(Mutex::new(HashMap::<String, Arc<UdpSocket>>::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let mut buffer = vec![0_u8; protocol::MAX_DATAGRAM_SIZE];
+
+    loop {
+        let datagram = match protocol::read_datagram(&mut reader, &mut buffer) {
+            Ok(datagram) => datagram.to_vec(),
+            Err(_) => break,
+        };
+        let (target, payload) = match protocol::parse_datagram(&datagram) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+
+        let socket = {
+            let mut targets = targets_map.lock().unwrap();
+            if let Some(socket) = targets.get(&target) {
+                socket.clone()
+            } else {
+                if targets.len() >= MAX_TARGETS {
+                    continue;
+                }
+                let socket = match UdpSocket::bind("0.0.0.0:0")
+                    .and_then(|socket| socket.connect(&target).map(|_| socket))
+                {
+                    Ok(socket) => Arc::new(socket),
+                    Err(error) => {
+                        debug!("UDP target {target} unavailable: {error}");
+                        continue;
+                    }
+                };
+                socket.set_read_timeout(Some(TARGET_IDLE)).ok();
+                socket.set_write_timeout(Some(IO_TIMEOUT)).ok();
+                targets.insert(target.clone(), socket.clone());
+                let writer = writer.clone();
+                let targets = targets_map.clone();
+                let done = done.clone();
+                let target_for_thread = target.clone();
+                let reply_socket = socket.clone();
+                std::thread::spawn(move || {
+                    relay_udp_replies(reply_socket, writer, targets, done, target_for_thread);
+                });
+                socket
+            }
+        };
+        socket.set_write_timeout(Some(IO_TIMEOUT)).ok();
+        let _ = socket.send(payload);
+    }
+
+    done.store(true, Ordering::Release);
+    for socket in targets_map.lock().unwrap().values() {
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+    }
+    Ok(())
+}
+
+fn relay_udp_replies<W: Write + Send + 'static>(
+    socket: Arc<UdpSocket>,
+    writer: Arc<Mutex<W>>,
+    targets: Arc<Mutex<HashMap<String, Arc<UdpSocket>>>>,
+    done: Arc<AtomicBool>,
+    target: String,
+) {
+    let mut buffer = vec![0_u8; protocol::MAX_DATAGRAM_SIZE];
+    while !done.load(Ordering::Acquire) {
+        match socket.recv(&mut buffer) {
+            Ok(length) => {
+                let payload = &buffer[..length];
+                let mut datagram = Vec::with_capacity(target.len() + payload.len() + 3);
+                if protocol::write_request(&mut datagram, &target).is_err()
+                    || datagram.len() + payload.len() > protocol::MAX_DATAGRAM_SIZE
+                {
+                    continue;
+                }
+                datagram.extend_from_slice(payload);
+                let mut writer = writer.lock().unwrap();
+                if protocol::write_datagram(&mut *writer, &datagram).is_err() {
+                    done.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    let mut targets = targets.lock().unwrap();
+    if targets
+        .get(&target)
+        .is_some_and(|current| Arc::ptr_eq(current, &socket))
+    {
+        targets.remove(&target);
+    }
 }
 
 fn connect_target_from_authority(target: &str) -> Result<TcpStream> {

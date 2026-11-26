@@ -7,5 +7,6 @@ timestamp = true
 [inbounds]
 listen = "0.0.0.0"
 listen_port = 443
+udp = true
 dest = "www.example.com"
 private_key = "replace-with-mio-keygen-PrivateKey"

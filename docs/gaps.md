@@ -1,6 +1,6 @@
-# v0.6.2 差异补全与可行性研究
+# v0.6.3 差异补全与可行性研究
 
-本文记录 Rust 重写与上游 `orgmio/mio` v0.6.2（线上协议 v0.6.2）的逐项差异。
+本文记录 Rust 重写与上游 `orgmio/mio` v0.6.3（线上协议 v1.0.0）的逐项差异。
 
 ## 总览
 
@@ -10,7 +10,9 @@
 | TCP 多路复用 stream | 已补全 | stream id、流量控制、close/reset/window 帧 |
 | 双认证记录 | 已补全 | 认证记录 nonce 0 + 份额记录 nonce 1 |
 | 服务端 QUIC UDP 分流 | 已补全 | 公钥派生 marker、replay cache、未标记 UDP relay |
-| 客户端 TCP/QUIC 并行探测 | 已补全 | 只并行建立/认证 session，获胜后再请求目标 |
+| UDP-over-mio 关联 | 已补全 | `00` 流请求、长度前缀 datagram、服务端多目标 UDP relay |
+| 客户端 SOCKS5 UDP ASSOCIATE | 已补全 | `socks5_udp=true`，经 TCP 代理流转发 UDP |
+| 客户端 TCP/QUIC 首选+备份 | 已补全 | 延迟启动备份，先成功打开目标者胜出 |
 | Chrome 156+ sigalgs | 已补全 | GREASE + ML-DSA-44/65/87，vendored BoringSSL |
 | BoringSSL ClientHello 私钥导出 | 已补全 | 自定义补丁，支持 HRR/config shedding |
 | QUIC BBR | 已启用 | Quinn 0.11.19 内置实验性 BBR，非上游逐行移植 |
@@ -18,7 +20,7 @@
 
 ## TCP 静态认证
 
-v0.6.2 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
+v0.6.3 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
 
 ```text
 shared = X25519(client TLS key_share private, server static public)
@@ -28,7 +30,7 @@ shared = X25519(client TLS key_share private, server static public)
 握手后客户端连续发送两条记录：
 
 ```text
-key       = HKDF(shared, client_random ‖ server_random, "mio auth 0.6.2")
+key       = HKDF(shared, client_random ‖ server_random, "mio auth 1.0.0")
 认证记录: nonce = 0，plaintext = random_padding(71)
 份额记录: nonce = 1，plaintext = client_share(1216) ‖ random_padding(0–255)
 header    = 17 03 03 ‖ length
@@ -47,7 +49,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 
 ## TCP 多路复用
 
-`src/session.rs` 实现 v0.6.2 `Session`：
+`src/session.rs` 实现 v0.6.3 `Session`：
 
 - 帧头：`type(1) ‖ stream_id(4) ‖ payload_length(2)`
 - ready/data/close/reset/window 五种帧
@@ -61,7 +63,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 - 首帧流编号和记录写入在同一个 write slot 内完成，保持编号和 TLS 记录顺序
 - 会话窗口更新由独立 control loop 合并发送；未知/已关闭流占用后归还的会话额度也会批量返还
 
-本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.6.2 客户端到 Rust 服务端
+本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.6.3 客户端到 Rust 服务端
 也通过了同一条 TCP 连接上的两条流。
 
 ## 服务端 QUIC UDP 分流
@@ -72,11 +74,23 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 2. 对每个 UDP 源地址维护 `Pending / Mio / Relay` 流状态。
 3. 解密 QUIC v1 Initial 并读取 ClientHello.random。
 4. marker key 由服务端静态公钥经
-   `HKDF(public_key, empty_salt, "mio quic marker 0.6.2")` 派生。
+   `HKDF(public_key, empty_salt, "mio quic marker 1.0.0")` 派生。
 5. 验证 16 字节 nonce + 16 字节分钟级 HMAC，接受当前分钟 ±1 分钟。
 6. 用 replay cache 拒绝重复 marker。
 7. 无 marker 的流按客户端地址建立到 `dest` 的 UDP relay，响应从同一服务端
    端口返回。
+
+## UDP-over-mio
+
+- 代理流首字节 `0` 表示 UDP 关联；服务端回复 `0` 后双方交换
+  `length(2) ‖ 地址 ‖ payload` 的独立数据报。
+- 服务端为每个关联维护目标 UDP socket，最多 64 个；空闲约 60 秒由读超时回收。
+- TCP 与 QUIC 服务端都支持该扩展。
+- 客户端 `[outbounds].socks5_udp = true` 时接受 SOCKS5 UDP ASSOCIATE，校验
+  控制连接对端地址、固定客户端 UDP 源地址、拒绝 FRAG 非零的数据报。
+- Rust 客户端当前通过 TCP 代理流承载 UDP 关联；上游也可能使用 QUIC，属于实现差异，
+  但线上 datagram 格式兼容。
+- 记录层每个方向限制同一密钥最多 `2^24` 条记录，达到上限前关闭会话。
 
 ## 客户端传输探测
 
@@ -98,8 +112,9 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 - `Dialer::close()` 在客户端停止时关闭缓存 QUIC 与所有 TCP session。Rust 同步 API
   没有 Go context 的完整取消语义。
 
-验证：Rust↔Go v0.6.2 的 TCP 强制路径、auto race 和 TCP 两 stream 均通过；
-Go v0.6.2 在该环境默认选择了 TCP，未单独强制其 QUIC 路径。Rust↔Rust QUIC E2E 通过。
+验证：Rust↔Go v0.6.3 的 TCP 强制路径、auto race 和 TCP 两 stream 均通过；
+Go v0.6.3 在该环境默认选择了 TCP，未单独强制其 QUIC 路径。Rust↔Rust QUIC E2E 通过。
+SOCKS5 UDP ASSOCIATE 使用 `udp=false` 的 TCP 隧道做了本机 UDP echo E2E，通过。
 
 ## BoringSSL 与 Chrome 156+
 

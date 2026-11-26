@@ -24,8 +24,8 @@ use crate::udp_demux::UdpDemuxSocket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const QUIC_EXPORTER_LABEL: &[u8] = b"mio quic auth";
-const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 0.6.2";
-const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 0.6.2";
+const QUIC_AUTH_INFO: &[u8] = b"mio quic auth 1.0.0";
+const QUIC_MARKER_INFO: &[u8] = b"mio quic marker 1.0.0";
 const QUIC_CLIENT_LABEL: &[u8] = b"client";
 const QUIC_SERVER_LABEL: &[u8] = b"server";
 const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -579,8 +579,18 @@ async fn serve_quic_connection(
 
 fn proxy_quic(mut stream: QuicStream) -> Result<()> {
     stream.set_read_timeout(Some(QUIC_REPLY_TIMEOUT));
-    let target = protocol::read_request(&mut stream).context("read QUIC target request")?;
+    let request = protocol::read_stream_request(&mut stream).context("read QUIC stream request")?;
     stream.set_read_timeout(None);
+    if request == protocol::StreamRequest::UdpAssociate {
+        protocol::write_reply(&mut stream, true)?;
+        stream.flush()?;
+        let (reader, writer) = stream.split();
+        return crate::server::relay_udp_association(reader, writer)
+            .context("relay QUIC UDP association");
+    }
+    let protocol::StreamRequest::Tcp(target) = request else {
+        unreachable!()
+    };
     let remote = match connect_target(&target) {
         Ok(remote) => remote,
         Err(error) => {

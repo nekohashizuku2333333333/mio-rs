@@ -1,8 +1,8 @@
 # Last upstream revision fully ported and verified against this Rust rewrite.
 [upstream]
 repository = "https://github.com/orgmio/mio"
-commit = "a48a9752ce36727a092c3ef65631d4cdc9d1a8e6"
-tag = "v0.6.2"
-binary_version = "0.6.2"
-protocol_version = "0.6.2"
-synced_at = "2026-11-24"
+commit = "6b1871633e0d980546f34d0f57725b84f9b4c75e"
+tag = "v0.6.3"
+binary_version = "0.6.3"
+protocol_version = "1.0.0"
+synced_at = "2026-11-26"

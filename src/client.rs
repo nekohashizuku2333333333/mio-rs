@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, info, warn};
 use rand::Rng;
 use std::io::{BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -28,8 +28,9 @@ const MAX_FALLBACK_DELAY: Duration = Duration::from_secs(1);
 const PROBE_HEAD_START: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone)]
-struct SocksRequest {
-    target: String,
+enum SocksRequest {
+    Connect(String),
+    UdpAssociate { port: u16 },
 }
 
 enum ProxyConnection {
@@ -61,6 +62,7 @@ struct Dialer {
     tcp_pool: Mutex<TcpPoolState>,
     state: Mutex<DialerState>,
     stop: Arc<AtomicBool>,
+    enable_quic: bool,
 }
 
 #[derive(Default)]
@@ -193,7 +195,7 @@ impl ProxyConnection {
 }
 
 impl Dialer {
-    fn new(peer: OutboundConfig, stop: Arc<AtomicBool>) -> Self {
+    fn new(peer: OutboundConfig, stop: Arc<AtomicBool>, enable_quic: bool) -> Self {
         Self {
             peer,
             tcp_pool: Mutex::new(TcpPoolState::default()),
@@ -206,12 +208,16 @@ impl Dialer {
                 quic_dial: None,
             }),
             stop,
+            enable_quic,
         }
     }
 
     fn dial(self: &Arc<Self>, target: &str) -> Result<ProxyConnection> {
         if self.stop.load(Ordering::Acquire) {
             bail!("dialer stopped");
+        }
+        if !self.enable_quic {
+            return self.dial_tcp(target).map(ProxyConnection::Tcp);
         }
         let (preferred, generation, delay) = {
             let mut state = self.state.lock().unwrap();
@@ -486,6 +492,18 @@ impl Dialer {
         bail!("all TCP sessions reached the stream limit")
     }
 
+    fn dial_udp_associate(&self) -> Result<Stream> {
+        for _ in 0..2 {
+            let session = self.tcp_session()?;
+            match open_tcp_request(&session, &protocol::StreamRequest::UdpAssociate) {
+                Ok(stream) => return Ok(stream),
+                Err(error) if is_stream_limit(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        bail!("all TCP sessions reached the stream limit")
+    }
+
     fn close(&self) {
         let quic = {
             let mut state = self.state.lock().unwrap();
@@ -539,14 +557,16 @@ pub fn run(outbound: OutboundConfig, stop: Arc<AtomicBool>) -> Result<()> {
         .set_nonblocking(true)
         .context("configure SOCKS5 listener")?;
     info!("SOCKS5 listening on {}", listener.local_addr()?);
-    let dialer = Arc::new(Dialer::new(outbound, stop.clone()));
+    let enable_quic = outbound.udp_enabled();
+    let socks5_udp = outbound.socks5_udp;
+    let dialer = Arc::new(Dialer::new(outbound, stop.clone(), enable_quic));
 
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, remote)) => {
                 let dialer = dialer.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, &dialer) {
+                    if let Err(error) = handle_client(stream, &dialer, socks5_udp) {
                         debug!("SOCKS5 connection from {remote} ended: {error:#}");
                     }
                 });
@@ -561,39 +581,47 @@ pub fn run(outbound: OutboundConfig, stop: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
-fn handle_client(mut client: TcpStream, dialer: &Arc<Dialer>) -> Result<()> {
+fn handle_client(mut client: TcpStream, dialer: &Arc<Dialer>, socks5_udp: bool) -> Result<()> {
     client.set_nodelay(true).ok();
     let remote = client.peer_addr()?;
     debug!("accepted SOCKS5 connection from {remote}");
-    let request = socks_handshake(&mut client)?;
-    info!("new connection from {} dest {}", remote, request.target);
-
-    let connection = match dialer.dial(&request.target) {
-        Ok(connection) => connection,
-        Err(error) => {
-            warn!("dial failed for {}: {error:#}", request.target);
-            let _ = socks_reply(&mut client, false);
-            return Err(error);
+    let request = socks_handshake(&mut client, socks5_udp)?;
+    match request {
+        SocksRequest::Connect(target) => {
+            info!("new connection from {remote} dest {target}");
+            let connection = match dialer.dial(&target) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    warn!("dial failed for {target}: {error:#}");
+                    let _ = socks_reply(&mut client, false);
+                    return Err(error);
+                }
+            };
+            socks_reply(&mut client, true)?;
+            match connection {
+                ProxyConnection::Tcp(stream) => {
+                    let reader = stream.clone();
+                    let writer = stream.clone();
+                    let result = protocol::relay_halves(client, reader, writer)
+                        .context("relay SOCKS5 TCP traffic");
+                    let _ = stream.close();
+                    result
+                }
+                ProxyConnection::Quic(stream) => {
+                    let (reader, writer) = stream.split();
+                    protocol::relay_halves(client, reader, writer)
+                        .context("relay SOCKS5 QUIC traffic")
+                }
+            }
         }
-    };
-    socks_reply(&mut client, true)?;
-    match connection {
-        ProxyConnection::Tcp(stream) => {
-            let reader = stream.clone();
-            let writer = stream.clone();
-            let result =
-                protocol::relay_halves(client, reader, writer).context("relay SOCKS5 TCP traffic");
-            let _ = stream.close();
-            result
-        }
-        ProxyConnection::Quic(stream) => {
-            let (reader, writer) = stream.split();
-            protocol::relay_halves(client, reader, writer).context("relay SOCKS5 QUIC traffic")
+        SocksRequest::UdpAssociate { port } => {
+            info!("UDP associate from {remote} requested port {port}");
+            handle_udp_associate(client, dialer, remote, port)
         }
     }
 }
 
-fn socks_handshake(client: &mut TcpStream) -> Result<SocksRequest> {
+fn socks_handshake(client: &mut TcpStream, socks5_udp: bool) -> Result<SocksRequest> {
     let mut greeting = [0_u8; 2];
     client.read_exact(&mut greeting)?;
     if greeting[0] != 5 {
@@ -609,9 +637,13 @@ fn socks_handshake(client: &mut TcpStream) -> Result<SocksRequest> {
 
     let mut header = [0_u8; 4];
     client.read_exact(&mut header)?;
-    if header[0] != 5 || header[1] != 1 || header[2] != 0 {
+    if header[0] != 5 || !matches!(header[1], 1 | 3) || header[2] != 0 {
         client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0])?;
         bail!("unsupported SOCKS5 request");
+    }
+    if header[1] == 3 && !socks5_udp {
+        client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0])?;
+        bail!("SOCKS5 UDP ASSOCIATE is disabled");
     }
     let host = match header[3] {
         1 => {
@@ -639,8 +671,143 @@ fn socks_handshake(client: &mut TcpStream) -> Result<SocksRequest> {
     let mut port = [0_u8; 2];
     client.read_exact(&mut port)?;
     let port = u16::from_be_bytes(port);
-    let target = format_target(&host, port);
-    Ok(SocksRequest { target })
+    if header[1] == 3 {
+        Ok(SocksRequest::UdpAssociate { port })
+    } else {
+        Ok(SocksRequest::Connect(format_target(&host, port)))
+    }
+}
+
+fn handle_udp_associate(
+    mut client: TcpStream,
+    dialer: &Arc<Dialer>,
+    remote: SocketAddr,
+    requested_port: u16,
+) -> Result<()> {
+    let local_ip = client.local_addr()?.ip();
+    let relay = UdpSocket::bind(SocketAddr::new(local_ip, 0))?;
+    relay.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let tunnel = match dialer.dial_udp_associate() {
+        Ok(tunnel) => tunnel,
+        Err(error) => {
+            let _ = socks_reply(&mut client, false);
+            return Err(error);
+        }
+    };
+    socks_reply_addr(&mut client, relay.local_addr()?)?;
+    run_socks_udp(client, relay, tunnel, remote.ip(), requested_port)
+}
+
+fn run_socks_udp(
+    mut control: TcpStream,
+    relay: UdpSocket,
+    tunnel: Stream,
+    peer_ip: IpAddr,
+    requested_port: u16,
+) -> Result<()> {
+    let done = Arc::new(AtomicBool::new(false));
+    let client_addr = Arc::new(Mutex::new(None::<SocketAddr>));
+    let writer = Arc::new(Mutex::new(tunnel.clone()));
+
+    let mut tunnel_reader = tunnel.clone();
+    let relay_for_replies = relay.try_clone()?;
+    let reply_done = done.clone();
+    let reply_client = client_addr.clone();
+    let reply_thread = std::thread::spawn(move || {
+        let mut buffer = vec![0_u8; protocol::MAX_DATAGRAM_SIZE];
+        while !reply_done.load(Ordering::Acquire) {
+            let datagram = match protocol::read_datagram(&mut tunnel_reader, &mut buffer) {
+                Ok(datagram) => datagram,
+                Err(_) => break,
+            };
+            let Some(address) = *reply_client.lock().unwrap() else {
+                continue;
+            };
+            let mut packet = Vec::with_capacity(3 + datagram.len());
+            packet.extend_from_slice(&[0, 0, 0]);
+            packet.extend_from_slice(datagram);
+            if relay_for_replies.send_to(&packet, address).is_err() {
+                break;
+            }
+        }
+        reply_done.store(true, Ordering::Release);
+    });
+
+    let control_done = done.clone();
+    let control_shutdown = control.try_clone()?;
+    let control_thread = std::thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        let _ = control.read(&mut byte);
+        control_done.store(true, Ordering::Release);
+    });
+
+    let mut packet = vec![0_u8; protocol::MAX_DATAGRAM_SIZE + 3];
+    while !done.load(Ordering::Acquire) {
+        let (length, address) = match relay.recv_from(&mut packet) {
+            Ok(value) => value,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                done.store(true, Ordering::Release);
+                return Err(error.into());
+            }
+        };
+        if address.ip() != peer_ip || (requested_port != 0 && address.port() != requested_port) {
+            continue;
+        }
+        if length <= 3 || packet[..3] != [0, 0, 0] {
+            continue;
+        }
+        let datagram = &packet[3..length];
+        if protocol::parse_datagram(datagram).is_err() {
+            continue;
+        }
+        {
+            let mut client_addr = client_addr.lock().unwrap();
+            if let Some(current) = *client_addr {
+                if current != address {
+                    continue;
+                }
+            } else {
+                *client_addr = Some(address);
+            }
+        }
+        let mut writer = writer.lock().unwrap();
+        if protocol::write_datagram(&mut *writer, datagram).is_err() {
+            done.store(true, Ordering::Release);
+            break;
+        }
+    }
+
+    done.store(true, Ordering::Release);
+    let _ = control_shutdown.shutdown(Shutdown::Both);
+    let _ = writer.lock().unwrap().close();
+    let _ = reply_thread.join();
+    let _ = control_thread.join();
+    Ok(())
+}
+
+fn socks_reply_addr(client: &mut TcpStream, address: SocketAddr) -> Result<()> {
+    let mut reply = vec![5, 0, 0];
+    match address.ip() {
+        IpAddr::V4(ip) => {
+            reply.push(1);
+            reply.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            reply.push(4);
+            reply.extend_from_slice(&ip.octets());
+        }
+    }
+    reply.extend_from_slice(&address.port().to_be_bytes());
+    client.write_all(&reply)?;
+    Ok(())
 }
 
 fn socks_reply(client: &mut TcpStream, success: bool) -> Result<()> {
@@ -719,9 +886,13 @@ fn remaining_handshake(deadline: Instant, phase: &str) -> Result<Duration> {
 }
 
 fn open_tcp_stream(session: &Session, target: &str) -> Result<Stream> {
+    open_tcp_request(session, &protocol::StreamRequest::Tcp(target.to_string()))
+}
+
+fn open_tcp_request(session: &Session, request: &protocol::StreamRequest) -> Result<Stream> {
     let mut stream = session.open().context("open TCP target stream")?;
     stream.set_next_padding(16, 512);
-    if let Err(error) = protocol::write_request(&mut stream, target) {
+    if let Err(error) = request.write_to(&mut stream) {
         let _ = stream.close();
         return Err(error);
     }
@@ -779,7 +950,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let dialer = Dialer::new(config, Arc::new(AtomicBool::new(false)));
+        let dialer = Dialer::new(config, Arc::new(AtomicBool::new(false)), true);
         let state = dialer.state.lock().unwrap();
         assert_eq!(state.preferred, TransportChoice::Tcp);
         assert!(state.quic.is_none());

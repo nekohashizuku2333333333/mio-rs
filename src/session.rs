@@ -22,6 +22,7 @@ pub const SESSION_WINDOW: usize = 32 << 20;
 pub const MAX_SESSION_STREAMS: usize = 100;
 const ACCEPT_BACKLOG: usize = MAX_SESSION_STREAMS;
 const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RECORDS_PER_KEY: u64 = 1 << 24;
 const SESSION_WINDOW_BATCH: Duration = Duration::from_millis(5);
 
 #[derive(Debug, thiserror::Error)]
@@ -364,6 +365,9 @@ impl SessionInner {
             .ok_or_else(|| anyhow!("session reader unavailable"))?;
         let mut recv = self.recv.lock().unwrap();
         loop {
+            if recv.sequence >= MAX_RECORDS_PER_KEY {
+                bail!("mio record key usage limit reached");
+            }
             let mut header = [0_u8; RECORD_HEADER_SIZE];
             reader.read_exact(&mut header)?;
             let length = u16::from_be_bytes([header[3], header[4]]) as usize;
@@ -523,6 +527,11 @@ impl SessionInner {
             .map_err(anyhow::Error::from)?;
 
         let mut send = self.send.lock().unwrap();
+        if send.sequence >= MAX_RECORDS_PER_KEY {
+            drop(send);
+            self.close_with_error("mio record key usage limit reached");
+            bail!("mio record key usage limit reached");
+        }
         let body_length = plain.len() + AEAD_OVERHEAD;
         if body_length > u16::MAX as usize {
             bail!("encrypted record body too large");
@@ -1000,6 +1009,9 @@ impl SessionInner {
     ) -> Result<(u8, u32, Vec<u8>)> {
         let mut recv = self.recv.lock().unwrap();
         loop {
+            if recv.sequence >= MAX_RECORDS_PER_KEY {
+                bail!("mio record key usage limit reached");
+            }
             let mut header = [0_u8; RECORD_HEADER_SIZE];
             reader.read_exact(&mut header)?;
             let length = u16::from_be_bytes([header[3], header[4]]) as usize;
@@ -1120,6 +1132,11 @@ mod tests {
     #[test]
     fn session_window_is_32_mib() {
         assert_eq!(SESSION_WINDOW, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn record_key_limit_is_16_million() {
+        assert_eq!(MAX_RECORDS_PER_KEY, 1 << 24);
     }
 
     #[test]

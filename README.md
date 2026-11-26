@@ -1,29 +1,32 @@
 # mio-rs
 
-`mio-rs` 是 [orgmio/mio](https://github.com/orgmio/mio) v0.6.2 的 Rust 重写。它实现：
+`mio-rs` 是 [orgmio/mio](https://github.com/orgmio/mio) v0.6.3 的 Rust 重写。它实现：
 
 - TCP 伪装站点转发、静态 X25519 认证、X25519MLKEM768 会话密钥交换
 - TCP 上的多路复用 stream、32 MiB 会话流控、每条流 16 MiB 流控、close/reset/window 帧
 - QUIC 同端口 UDP marker 分流、静态密钥双向证明、stream 代理
-- SOCKS5 `CONNECT` 客户端
+- SOCKS5 `CONNECT` 客户端，可选 UDP ASSOCIATE
+- UDP-over-mio 关联：长度前缀数据报、服务端 64 目标 socket 上限
 - Chrome 156+ TCP ClientHello 指纹（uTLS Chrome 133 扩展集 + ML-DSA sigalgs）
 - 初始 TCP、首选路径 + 延迟备份竞争、动态运输选择与 10–30 分钟重新比较
 - Quinn 实验性 BBR，初始窗口 `32 × MTU`
 
-二进制版本是 `0.6.2`，线上协议版本是 `0.6.2`。协议版本参与 TCP auth label、QUIC
+二进制版本是 `0.6.3`，线上协议版本是 `1.0.0`。协议版本参与 TCP auth label、QUIC
 marker 和 QUIC auth key 派生；客户端和服务端必须使用相同的协议版本。
 
 ## 状态
 
 | 功能 | 状态 |
 | --- | --- |
-| mio v0.6.2 TCP 两条认证记录、ready、混合密钥交换 | 已实现 |
+| mio v0.6.3 TCP 两条认证记录、ready、混合密钥交换 | 已实现 |
 | 服务端 TCP 伪装转发与认证接管 | 已实现 |
 | TCP 多路复用会话、32 MiB 会话窗口、16 MiB stream window、100 流上限 | 已实现 |
 | 服务端 QUIC UDP marker 分流 | 已实现 |
 | 未标记 UDP 转发到 `dest`（每 5 分钟刷新目标地址） | 已实现 |
 | QUIC exporter HMAC 静态密钥认证 | 已实现 |
-| SOCKS5 客户端 | 已实现 |
+| SOCKS5 `CONNECT` 客户端 | 已实现 |
+| SOCKS5 UDP ASSOCIATE（`socks5_udp=true`） | 已实现 |
+| UDP-over-mio 关联与 datagram 帧 | 已实现 |
 | TCP/QUIC 首选 + 延迟备份竞争、动态选路与自动回退 | 已实现 |
 | Chrome 156+ TCP ClientHello | JA4/canonical JA3 匹配；含 GREASE + ML-DSA sigalgs |
 | QUIC TLS 指纹 | Quinn/rustls，不是 Chrome |
@@ -54,7 +57,7 @@ CARGO_HOME="$PWD/.cargo-home" cargo build --release
 2. `patches/boringssl-no-sigalg-grease.patch`（Chrome 156+ sigalg shape）
 3. `patches/boringssl-x25519-key-share.patch`（导出 ClientHello X25519 私钥）
 
-第三项是 v0.6.2 所必需的：上游用 TLS ClientHello 里的 X25519 key_share 私钥与
+第三项是 v0.6.3 所必需的：上游用 TLS ClientHello 里的 X25519 key_share 私钥与
 服务端静态公钥计算认证共享密钥，stock BoringSSL 不提供该私钥。
 
 重新构建内置 BoringSSL：
@@ -134,7 +137,7 @@ private_key = "mio keygen 生成的 PrivateKey"
 3. 客户端连续发送两条 TLS Application Data 记录：
    - 认证记录：nonce 0，71 字节随机明文；
    - 份额记录：nonce 1，`share(1216) ‖ padding(0–255)`。
-   - key 为 `HKDF(shared, client_random‖server_random, "mio auth 0.6.2")`，header
+   - key 为 `HKDF(shared, client_random‖server_random, "mio auth 1.0.0")`，header
      作为 AAD。
 4. 服务端校验认证记录，再读取份额记录；生成 X25519MLKEM768 服务端份额，用初始
    会话密钥发出 ready 帧，最后切换到包含混合 secret 的会话密钥。
@@ -148,7 +151,7 @@ private_key = "mio keygen 生成的 PrivateKey"
 - 合法 marker 交给 Quinn；未标记 UDP 流按客户端地址转发到 `dest` 并回传响应。
 - 握手后首个 stream：客户端临时 X25519 公钥 + 客户端 HMAC；服务端返回服务端 HMAC。
 - HMAC key 由静态 X25519 shared 与 TLS exporter 通过
-  `"mio quic auth 0.6.2"` 派生。
+  `"mio quic auth 1.0.0"` 派生。
 
 完整线上格式见 [docs/protocol.md](docs/protocol.md)。
 
@@ -189,17 +192,19 @@ python3 scripts/udp_relay_local.py
 - TCP 多 stream 会话复用
 - Chrome ClientHello 离线回归
 - 未标记 UDP 伪装转发
-- Rust 客户端 ↔ Go v0.6.2 服务端 TCP 互操作；Rust↔Rust QUIC E2E
+- SOCKS5 UDP ASSOCIATE over TCP tunnel
+- Rust 客户端 ↔ Go v0.6.3 服务端 TCP 互操作；Rust↔Rust QUIC E2E
 
 结果：
 
 ```text
-cargo test                         30 unit + 2 fingerprint regression PASS
+cargo test                         33 unit + 2 fingerprint regression PASS
 scripts/e2e_local.py               Rust client/server two-request session PASS
 scripts/udp_relay_local.py         UDP camouflage relay PASS
-Rust client -> Go v0.6.2, auto race PASS (TCP selected)
-Rust client -> Go v0.6.2, forced TCP PASS
-Go v0.6.2 client -> Rust, TCP two streams PASS
+socks5 UDP ASSOCIATE E2E           UDP echo over TCP tunnel PASS
+Rust client -> Go v0.6.3, auto race PASS (TCP selected)
+Rust client -> Go v0.6.3, forced TCP PASS
+Go v0.6.3 client -> Rust, TCP two streams PASS
 ```
 
 ## 目录
@@ -207,12 +212,12 @@ Go v0.6.2 client -> Rust, TCP two streams PASS
 - `src/tls.rs`：Chrome ClientHello、BoringSSL 握手边界、私钥导出和指纹解析
 - `src/crypto.rs`：静态密钥、HKDF、AES-GCM、X25519MLKEM768
 - `src/protocol.rs`：TLS record、请求/应答和 relay helper
-- `src/session.rs`：v0.6.2 多路复用流、window/close/reset 帧和 TCP 记录层
+- `src/session.rs`：v0.6.3 多路复用流、window/close/reset 帧和 TCP 记录层
 - `src/client.rs`：SOCKS5、TCP session pool、TCP/QUIC 探测和回退
 - `src/server.rs`：伪装转发、静态认证接管、stream 代理
 - `src/quic.rs`：Quinn、BBR、QUIC marker/proof 和 stream 代理
 - `src/udp_demux.rs`：QUIC Initial 解析、UDP 分流和伪装 relay
-- `src/config.rs`：v0.6.2 严格 TOML 配置
+- `src/config.rs`：v0.6.3 严格 TOML 配置
 
 ## 已知差异
 

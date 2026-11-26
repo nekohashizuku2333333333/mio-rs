@@ -46,6 +46,8 @@ pub struct OutboundConfig {
     #[serde(default)]
     pub socks_listen_port: u16,
     #[serde(default)]
+    pub socks5_udp: bool,
+    #[serde(default)]
     pub server: String,
     #[serde(default = "default_port")]
     pub server_port: u16,
@@ -55,9 +57,17 @@ pub struct OutboundConfig {
     pub dest_port: u16,
     #[serde(default)]
     pub public_key: String,
+    #[serde(default)]
+    pub udp: Option<bool>,
     /// Local test-only switch. Upstream does not expose this field.
     #[serde(default)]
     pub insecure: bool,
+}
+
+impl OutboundConfig {
+    pub fn udp_enabled(&self) -> bool {
+        self.udp.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -73,6 +83,14 @@ pub struct InboundConfig {
     pub dest_port: u16,
     #[serde(default)]
     pub private_key: String,
+    #[serde(default)]
+    pub udp: Option<bool>,
+}
+
+impl InboundConfig {
+    pub fn udp_enabled(&self) -> bool {
+        self.udp.unwrap_or(true)
+    }
 }
 
 impl Config {
@@ -243,11 +261,33 @@ mod tests {
         .unwrap();
         config.validate().unwrap();
         assert_eq!(config.inbounds.dest_port, 0);
+        assert!(config.inbounds.udp_enabled());
         let effective = if config.inbounds.dest_port == 0 {
             config.inbounds.listen_port
         } else {
             config.inbounds.dest_port
         };
         assert_eq!(effective, 8443);
+    }
+
+    #[test]
+    fn udp_switches_are_optional_and_default_enabled() {
+        let config: Config = toml::from_str(
+            r#"
+            [outbounds]
+            socks_listen = "127.0.0.1"
+            socks_listen_port = 1080
+            socks5_udp = true
+            server = "example.com"
+            dest = "www.example.com"
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            udp = false
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.outbounds.socks5_udp);
+        assert!(!config.outbounds.udp_enabled());
+        assert!(config.inbounds.udp_enabled());
     }
 }

@@ -204,11 +204,41 @@ fn copy_half<R: Read, W: Write + CloseWrite>(
     }
 }
 
+pub const ADDR_UDP_ASSOCIATE: u8 = 0;
 pub const ADDR_IPV4: u8 = 1;
 pub const ADDR_DOMAIN: u8 = 3;
 pub const ADDR_IPV6: u8 = 4;
 pub const REPLY_OK: u8 = 0;
 pub const REPLY_FAIL: u8 = 1;
+pub const MAX_DATAGRAM_SIZE: usize = 65_504;
+const MIN_DATAGRAM_SIZE: usize = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamRequest {
+    Tcp(String),
+    UdpAssociate,
+}
+
+impl StreamRequest {
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        match self {
+            Self::Tcp(target) => write_request(writer, target),
+            Self::UdpAssociate => {
+                writer.write_all(&[ADDR_UDP_ASSOCIATE])?;
+                Ok(())
+            }
+        }
+    }
+}
+
+pub fn read_stream_request<R: Read>(reader: &mut R) -> Result<StreamRequest> {
+    let mut kind = [0_u8; 1];
+    reader.read_exact(&mut kind)?;
+    match kind[0] {
+        ADDR_UDP_ASSOCIATE => Ok(StreamRequest::UdpAssociate),
+        other => Ok(StreamRequest::Tcp(read_target(reader, other)?)),
+    }
+}
 
 pub fn write_request<W: Write>(writer: &mut W, target: &str) -> Result<()> {
     let (host, port) = split_host_port(target)?;
@@ -243,7 +273,11 @@ pub fn write_request<W: Write>(writer: &mut W, target: &str) -> Result<()> {
 pub fn read_request<R: Read>(reader: &mut R) -> Result<String> {
     let mut kind = [0_u8; 1];
     reader.read_exact(&mut kind)?;
-    let host = match kind[0] {
+    read_target(reader, kind[0])
+}
+
+fn read_target<R: Read>(reader: &mut R, kind: u8) -> Result<String> {
+    let host = match kind {
         ADDR_IPV4 => {
             let mut octets = [0_u8; 4];
             reader.read_exact(&mut octets)?;
@@ -285,6 +319,40 @@ pub fn read_reply<R: Read>(reader: &mut R) -> Result<bool> {
     Ok(status[0] == REPLY_OK)
 }
 
+pub fn write_datagram<W: Write>(writer: &mut W, datagram: &[u8]) -> Result<()> {
+    if !(MIN_DATAGRAM_SIZE..=MAX_DATAGRAM_SIZE).contains(&datagram.len()) {
+        bail!("invalid mio UDP datagram size");
+    }
+    let mut header = [0_u8; 2];
+    header.copy_from_slice(&(datagram.len() as u16).to_be_bytes());
+    writer.write_all(&header)?;
+    writer.write_all(datagram)?;
+    Ok(())
+}
+
+pub fn read_datagram<'a, R: Read>(reader: &mut R, buffer: &'a mut [u8]) -> Result<&'a [u8]> {
+    let mut header = [0_u8; 2];
+    reader.read_exact(&mut header)?;
+    let size = u16::from_be_bytes(header) as usize;
+    if !(MIN_DATAGRAM_SIZE..=MAX_DATAGRAM_SIZE).contains(&size) || size > buffer.len() {
+        bail!("invalid mio UDP datagram size");
+    }
+    reader.read_exact(&mut buffer[..size])?;
+    Ok(&buffer[..size])
+}
+
+pub fn parse_datagram(datagram: &[u8]) -> Result<(String, &[u8])> {
+    let mut cursor = std::io::Cursor::new(datagram);
+    let mut kind = [0_u8; 1];
+    cursor.read_exact(&mut kind)?;
+    if kind[0] == ADDR_UDP_ASSOCIATE {
+        bail!("invalid UDP datagram address type");
+    }
+    let endpoint = read_target(&mut cursor, kind[0])?;
+    let consumed = cursor.position() as usize;
+    Ok((endpoint, &datagram[consumed..]))
+}
+
 pub fn split_host_port(target: &str) -> Result<(&str, &str)> {
     if let Some(stripped) = target.strip_prefix('[') {
         let (host, rest) = stripped
@@ -320,6 +388,35 @@ mod tests {
             write_request(&mut bytes, target).unwrap();
             assert_eq!(read_request(&mut bytes.as_slice()).unwrap(), target);
         }
+    }
+
+    #[test]
+    fn stream_request_and_datagram_round_trip() {
+        let request = StreamRequest::Tcp("example.com:53".to_string());
+        let mut bytes = Vec::new();
+        request.write_to(&mut bytes).unwrap();
+        assert_eq!(read_stream_request(&mut bytes.as_slice()).unwrap(), request);
+
+        let mut udp = Vec::new();
+        StreamRequest::UdpAssociate.write_to(&mut udp).unwrap();
+        assert_eq!(
+            read_stream_request(&mut udp.as_slice()).unwrap(),
+            StreamRequest::UdpAssociate
+        );
+
+        let datagram = {
+            let mut bytes = Vec::new();
+            write_request(&mut bytes, "1.1.1.1:53").unwrap();
+            bytes.extend_from_slice(b"dns payload");
+            bytes
+        };
+        let mut framed = Vec::new();
+        write_datagram(&mut framed, &datagram).unwrap();
+        let mut buffer = [0_u8; MAX_DATAGRAM_SIZE];
+        let decoded = read_datagram(&mut framed.as_slice(), &mut buffer).unwrap();
+        let (target, payload) = parse_datagram(decoded).unwrap();
+        assert_eq!(target, "1.1.1.1:53");
+        assert_eq!(payload, b"dns payload");
     }
 
     #[test]
