@@ -581,6 +581,11 @@ fn proxy_quic(mut stream: QuicStream) -> Result<()> {
     stream.set_read_timeout(Some(QUIC_REPLY_TIMEOUT));
     let request = protocol::read_stream_request(&mut stream).context("read QUIC stream request")?;
     stream.set_read_timeout(None);
+    if request == protocol::StreamRequest::ProbeEarlyTcp {
+        protocol::write_reply(&mut stream, true)?;
+        stream.flush()?;
+        return Ok(());
+    }
     if request == protocol::StreamRequest::UdpAssociate {
         protocol::write_reply(&mut stream, true)?;
         stream.flush()?;

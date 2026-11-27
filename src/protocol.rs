@@ -206,6 +206,7 @@ fn copy_half<R: Read, W: Write + CloseWrite>(
 
 pub const ADDR_UDP_ASSOCIATE: u8 = 0;
 pub const ADDR_IPV4: u8 = 1;
+pub const PROBE_EARLY_TCP: u8 = 2;
 pub const ADDR_DOMAIN: u8 = 3;
 pub const ADDR_IPV6: u8 = 4;
 pub const REPLY_OK: u8 = 0;
@@ -217,6 +218,7 @@ const MIN_DATAGRAM_SIZE: usize = 5;
 pub enum StreamRequest {
     Tcp(String),
     UdpAssociate,
+    ProbeEarlyTcp,
 }
 
 impl StreamRequest {
@@ -225,6 +227,10 @@ impl StreamRequest {
             Self::Tcp(target) => write_request(writer, target),
             Self::UdpAssociate => {
                 writer.write_all(&[ADDR_UDP_ASSOCIATE])?;
+                Ok(())
+            }
+            Self::ProbeEarlyTcp => {
+                writer.write_all(&[PROBE_EARLY_TCP])?;
                 Ok(())
             }
         }
@@ -236,6 +242,7 @@ pub fn read_stream_request<R: Read>(reader: &mut R) -> Result<StreamRequest> {
     reader.read_exact(&mut kind)?;
     match kind[0] {
         ADDR_UDP_ASSOCIATE => Ok(StreamRequest::UdpAssociate),
+        PROBE_EARLY_TCP => Ok(StreamRequest::ProbeEarlyTcp),
         other => Ok(StreamRequest::Tcp(read_target(reader, other)?)),
     }
 }
@@ -402,6 +409,13 @@ mod tests {
         assert_eq!(
             read_stream_request(&mut udp.as_slice()).unwrap(),
             StreamRequest::UdpAssociate
+        );
+
+        let mut early = Vec::new();
+        StreamRequest::ProbeEarlyTcp.write_to(&mut early).unwrap();
+        assert_eq!(
+            read_stream_request(&mut early.as_slice()).unwrap(),
+            StreamRequest::ProbeEarlyTcp
         );
 
         let datagram = {

@@ -9,7 +9,7 @@ github.com/refraction-networking/utls v1.8.2
 utls.HelloChrome_Auto
 ```
 
-上游使用 uTLS v1.8.2；其中 `HelloChrome_Auto == HelloChrome_133`。v0.6.3 在该
+上游使用 uTLS v1.8.2；其中 `HelloChrome_Auto == HelloChrome_133`。v0.6.5 在该
 spec 的 `signature_algorithms` 前插入一个随机 GREASE 值和 ML-DSA-44/65/87，并在
 每条 TCP 连接新建 `UClient`，没有 session cache，因此观察对象是无 PSK、无恢复的
 首次 ClientHello。
@@ -108,7 +108,7 @@ Chrome 106+ 与 uTLS `ShuffleChromeTLSExtensions` 会随机打乱 16 个非 GREA
 ## BoringSSL 补丁与 vendored 构建
 
 stock BoringSSL 的默认 sigalg 列表不含 Chrome 156+ 的 GREASE + ML-DSA 前缀，也
-不会暴露 TLS ClientHello 的 X25519 key_share 私钥。mio v0.6.3 的静态认证需要后者，
+不会暴露 TLS ClientHello 的 X25519 key_share 私钥。mio v0.6.5 的静态认证需要后者，
 指纹需要前者，因此仓库内置 `vendor/boringssl` 并在其上应用三个补丁：
 
 1. `boring-pq.patch`（boring-sys 的 Cloudflare PQ 补丁）
@@ -124,7 +124,7 @@ stock BoringSSL 的默认 sigalg 列表不含 Chrome 156+ 的 GREASE + ML-DSA �
 ```text
 stock boring      1821 bytes
 patched           1821 bytes
-uTLS v0.6.3 profile  1825 bytes
+uTLS v0.6.5 profile  1825 bytes
 ```
 
 X25519 补丁通过真实 TLS 1.3 握手、HelloRetryRequest、`SSL_CONFIG` shedding 和
@@ -143,5 +143,5 @@ hybrid-only 的 ClientHello 返回 0。
 输出中的 `chrome_156_match=true` 要求 JA4 和 canonical JA3 MD5 同时匹配。离线样本
 测试位于 `tests/fingerprint.rs`；真实 Chrome 156/158 还会发送上游未实现的
 `trust_anchors (0xca34)`，因此浏览器捕获的 JA4 是 `..._cb7bf5808d99`，而本实现与
-上游 v0.6.3 对齐为 `..._806a8c22fdea`。`vendor/boringssl` 的 X25519 补丁探针位于
+上游 v0.6.5 对齐为 `..._806a8c22fdea`。`vendor/boringssl` 的 X25519 补丁探针位于
 `.research/v051-bssl/probe/x25519_probe.cc` 和 `test-output.txt`，其测试覆盖 HRR 和配置 shedding。

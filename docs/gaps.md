@@ -1,6 +1,6 @@
-# v0.6.3 差异补全与可行性研究
+# v0.6.5 差异补全与可行性研究
 
-本文记录 Rust 重写与上游 `orgmio/mio` v0.6.3（线上协议 v1.0.0）的逐项差异。
+本文记录 Rust 重写与上游 `orgmio/mio` v0.6.5（线上协议 v1.0.1）的逐项差异。
 
 ## 总览
 
@@ -20,7 +20,7 @@
 
 ## TCP 静态认证
 
-v0.6.3 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
+v0.6.5 不使用密码。服务端持有一对 X25519 静态密钥，客户端只配置公钥：
 
 ```text
 shared = X25519(client TLS key_share private, server static public)
@@ -49,7 +49,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 
 ## TCP 多路复用
 
-`src/session.rs` 实现 v0.6.3 `Session`：
+`src/session.rs` 实现 v0.6.5 `Session`：
 
 - 帧头：`type(1) ‖ stream_id(4) ‖ payload_length(2)`
 - ready/data/close/reset/window 五种帧
@@ -63,7 +63,7 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 - 首帧流编号和记录写入在同一个 write slot 内完成，保持编号和 TLS 记录顺序
 - 会话窗口更新由独立 control loop 合并发送；未知/已关闭流占用后归还的会话额度也会批量返还
 
-本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.6.3 客户端到 Rust 服务端
+本地测试覆盖两个连续 SOCKS 请求复用同一 session；Go v0.6.5 客户端到 Rust 服务端
 也通过了同一条 TCP 连接上的两条流。
 
 ## 服务端 QUIC UDP 分流
@@ -92,6 +92,12 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
   但线上 datagram 格式兼容。
 - 记录层每个方向限制同一密钥最多 `2^24` 条记录，达到上限前关闭会话。
 
+## Early TCP
+
+- 服务端识别单字节 `02` 探测并回复 `00`，不建立目标连接。
+- 普通 TCP 请求之后提前到达的应用数据由 `Session`/`Stream` 缓冲；服务端仅在目标连接成功并写完成功应答后才 relay，目标失败时丢弃该流。
+- Rust 客户端目前不暴露等价的 `DialEarly` API，也不主动探测/发送提前数据；Go v0.6.5 客户端仍可正常使用普通模式。该差异不影响线上协议互通。
+
 ## 客户端传输探测
 
 实现位于 `src/client.rs::Dialer`：
@@ -112,8 +118,8 @@ BoringSSL 本身不暴露 ClientHello X25519 key_share 私钥。`vendor/boringss
 - `Dialer::close()` 在客户端停止时关闭缓存 QUIC 与所有 TCP session。Rust 同步 API
   没有 Go context 的完整取消语义。
 
-验证：Rust↔Go v0.6.3 的 TCP 强制路径、auto race 和 TCP 两 stream 均通过；
-Go v0.6.3 在该环境默认选择了 TCP，未单独强制其 QUIC 路径。Rust↔Rust QUIC E2E 通过。
+验证：Rust↔Go v0.6.5 的 TCP 强制路径、auto race 和 TCP 两 stream 均通过；
+Go v0.6.5 在该环境默认选择了 TCP，未单独强制其 QUIC 路径。Rust↔Rust QUIC E2E 通过。
 SOCKS5 UDP ASSOCIATE 使用 `udp=false` 的 TCP 隧道做了本机 UDP echo E2E，通过。
 
 ## BoringSSL 与 Chrome 156+
@@ -153,8 +159,9 @@ sampler。因此口径是“已启用 Quinn 实验性 BBR”，不是“算法�
 ## 保留差异
 
 - QUIC 的 TLS 栈是 rustls，不是 Chrome/uTLS；上游 QUIC 自身也不是 Chrome 指纹。
-- Quinn BBR 不是上游算法逐行等价实现。
-- 不提供 UDP-over-SOCKS5。
+- Quinn BBR 不是上游算法逐行等价实现；v0.6.5 的 BBR sampler/pacer 修正未照搬。
+- Rust 不暴露 Go 的 `DialEarly` / `ListenUDP` 通用库接口；服务端支持 early 探测，
+  CLI 的 SOCKS5 UDP ASSOCIATE 已实现。
 - QUIC 未复刻上游的零长度源 Connection ID。
 - 未复刻 Go 的 recvmmsg / OOB / GSO 优化；Rust 继续使用 Quinn 自身的分段发送和
   `AsyncUdpSocket` 路径。收包 Vec 在循环外复用，relay 缓冲保持 2048 字节。
@@ -164,5 +171,5 @@ sampler。因此口径是“已启用 Quinn 实验性 BBR”，不是“算法�
   Rust 的 Session 结构不同，暂未逐项照搬，线上帧长度语义保持一致。
 - Rust TCP session pool 没有复刻 Go 客户端 4–6 分钟空闲回收；当前按 100 条流上限或
   session 关闭来换新连接。
-- Rust 同步 API 没有 Go context 的完整取消语义；QUIC 使用显式 timeout/retire，TCP
+- Rust 同步 API 没有 Go context 的完整取消语义；QUIC 使用显式 timeout，TCP
   建连仍受同步 DNS 解析和 10 秒握手预算限制。

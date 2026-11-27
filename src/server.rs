@@ -322,6 +322,12 @@ fn proxy_stream(mut stream: Stream) -> Result<()> {
     stream.set_read_timeout(None);
     stream.set_next_padding(16, 512);
 
+    if request == protocol::StreamRequest::ProbeEarlyTcp {
+        protocol::write_reply(&mut stream, true)?;
+        stream.close()?;
+        return Ok(());
+    }
+
     if request == protocol::StreamRequest::UdpAssociate {
         protocol::write_reply(&mut stream, true)?;
         let reader = stream.clone();

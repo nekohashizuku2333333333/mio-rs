@@ -13,5 +13,5 @@ server_port = 443
 udp = true
 dest = "www.example.com"
 public_key = "replace-with-mio-keygen-PublicKey"
-# Local test only; upstream v0.6.3 does not have this field.
+# Local test only; upstream v0.6.5 does not have this field.
 # insecure = true
